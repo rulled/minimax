@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "MiniMax TTS Automation",
+  "version": "3.0.0",
+  "description": "Автоматическая озвучка скриптов и умная организация загрузок TTS файлов с MiniMax.io",
+  "icons": {
+	"16":"icons/16.png",
+	"32":"icons/32.png",
+	"48":"icons/48.png",
+	"128":"icons/128.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'"
+  },
+  "permissions": [
+    "storage",
+    "downloads",
+    "activeTab",
+	"scripting"
+  ],
+  "host_permissions": [
+    "https://www.minimax.io/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.minimax.io/audio/text-to-speech*"],
+      "js": ["content_script.js"]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "homepage_url": "https://github.com/rulled/minimax"
+}
