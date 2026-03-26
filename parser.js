@@ -17,6 +17,15 @@ function cleanText(text) {
     .trim();
 }
 
+function parseMetadataComment(line) {
+  const match = String(line || '').trim().match(/^<!--\s*([a-zA-Z0-9_ -]+?)\s*:\s*(.*?)\s*-->$/);
+  if (!match) return null;
+  return {
+    key: match[1].trim().toLowerCase().replace(/\s+/g, '_'),
+    value: match[2].trim()
+  };
+}
+
 // УЛУЧШЕННАЯ ФУНКЦИЯ - извлекает "Отзыв N пол" из сложных тегов
 function normalizeSpeakerName(rawName) {
   // 1. Убираем markdown символы (звездочки, слеши, двоеточия по краям)
@@ -56,23 +65,51 @@ function parseMarkdown(markdownText) {
   const lines = markdownText.split(/\r\n|\r|\n/);
   const entries = [];
   let currentEntry = null;
-  // УБРАЛИ globalIndexCounter
+  const currentContext = {
+    languageCode: '',
+    minimaxLanguage: '',
+    niche: '',
+    packId: '',
+    sourceTag: ''
+  };
 
   const headerRegex = /^(?:\\)?\*\*(?:\\)?\*?(.+?)(?:\\)?\*?(?:\\)?\*\*(?:\s*:)?(.*)$/;
+
+  function finalizeCurrentEntry() {
+    if (!currentEntry || !currentEntry.text.trim()) return;
+    entries.push({
+      ...currentEntry,
+      text: cleanText(currentEntry.text)
+    });
+    currentEntry = null;
+  }
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
 
+    const metadata = parseMetadataComment(line);
+    if (metadata) {
+      finalizeCurrentEntry();
+
+      if (metadata.key === 'language_code' || metadata.key === 'target_language_code') {
+        currentContext.languageCode = metadata.value.toUpperCase();
+      } else if (metadata.key === 'minimax_language') {
+        currentContext.minimaxLanguage = metadata.value;
+      } else if (metadata.key === 'niche') {
+        currentContext.niche = metadata.value;
+      } else if (metadata.key === 'pack_id') {
+        currentContext.packId = metadata.value;
+      } else if (metadata.key === 'source_tag') {
+        currentContext.sourceTag = metadata.value;
+      }
+      continue;
+    }
+
     const headerMatch = line.match(headerRegex);
 
     if (headerMatch) {
-      if (currentEntry && currentEntry.text.trim()) {
-        entries.push({
-          ...currentEntry,
-          text: cleanText(currentEntry.text)
-        });
-      }
+      finalizeCurrentEntry();
 
       let rawSpeaker = headerMatch[1].trim();
       let inlineText = headerMatch[2] ? headerMatch[2].trim() : '';
@@ -82,6 +119,11 @@ function parseMarkdown(markdownText) {
         id: `${finalSpeaker.replace(/\s+/g, '_')}-${i}`,
         speaker: finalSpeaker,
         originalTag: rawSpeaker, // Сохраняем полный оригинальный тег
+        languageCode: currentContext.languageCode || '',
+        minimaxLanguage: currentContext.minimaxLanguage || '',
+        niche: currentContext.niche || '',
+        packId: currentContext.packId || '',
+        sourceTag: currentContext.sourceTag || '',
         text: inlineText,
         preview: ''
       };
@@ -90,12 +132,7 @@ function parseMarkdown(markdownText) {
     }
   }
 
-  if (currentEntry && currentEntry.text.trim()) {
-    entries.push({
-      ...currentEntry,
-      text: cleanText(currentEntry.text)
-    });
-  }
+  finalizeCurrentEntry();
 
   // Генерация превью
   entries.forEach(entry => {

@@ -11,6 +11,50 @@ document.addEventListener('DOMContentLoaded', async () => {
     "Swedish", "Croatian", "Filipino", "Hungarian", "Norwegian",
     "Slovenian", "Catalan", "Nynorsk", "Tamil", "Afrikaans"
   ];
+  const DEFAULT_MULTI_LANGUAGE = 'Russian';
+  const LANGUAGE_CODE_TO_MINIMAX = {
+    AF: 'Afrikaans',
+    AR: 'Arabic',
+    BG: 'Bulgarian',
+    CA: 'Catalan',
+    CS: 'Czech',
+    DA: 'Danish',
+    DE: 'German',
+    EL: 'Greek',
+    EN: 'English',
+    ES: 'Spanish',
+    FA: 'Persian',
+    FI: 'Finnish',
+    FIL: 'Filipino',
+    FR: 'French',
+    GR: 'Greek',
+    HE: 'Hebrew',
+    HI: 'Hindi',
+    HR: 'Croatian',
+    HU: 'Hungarian',
+    ID: 'Indonesian',
+    IT: 'Italian',
+    JA: 'Japanese',
+    KO: 'Korean',
+    MS: 'Malay',
+    NL: 'Dutch',
+    NN: 'Nynorsk',
+    NO: 'Norwegian',
+    PL: 'Polish',
+    PT: 'Portuguese',
+    RO: 'Romanian',
+    RU: 'Russian',
+    SK: 'Slovak',
+    SL: 'Slovenian',
+    SV: 'Swedish',
+    TA: 'Tamil',
+    TH: 'Thai',
+    TR: 'Turkish',
+    UA: 'Ukrainian',
+    UK: 'Ukrainian',
+    VI: 'Vietnamese',
+    ZH: 'Chinese (Mandarin)'
+  };
 
   let parsedEntries = [];
   
@@ -21,6 +65,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Multi Mode
   let voiceMappings = {};
+  let cachedSiteVoices = [];
   let multiExcludedIds = new Set();
   let activeMode = 'single';
 
@@ -77,6 +122,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   const multiFileName = document.getElementById('multiFileName');
   const multiConfigContainer = document.getElementById('multiConfigContainer');
   const voiceMappingList = document.getElementById('voiceMappingList');
+  const multiVoicePrefixInput = document.getElementById('multiVoicePrefixInput');
+  const refreshSiteVoicesButton = document.getElementById('refreshSiteVoicesButton');
+  const siteVoicesStatus = document.getElementById('siteVoicesStatus');
   // Removed: const multiPreviewList = document.getElementById('multiPreviewList');
   // Removed: const multiSelectionCount = document.getElementById('multiSelectionCount');
   // Removed: const multiToggleSelectionBtn = document.getElementById('multiToggleSelectionBtn');
@@ -84,7 +132,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   const resetMultiButton = document.getElementById('resetMultiButton');
   const multiStatus = document.getElementById('multiStatus');
   const multiSkippedReportArea = document.getElementById('multiSkippedReportArea');
-  const multiLanguageSelect = document.getElementById('multiLanguageSelect');
 
   // Батч элементы
   const batchFilesCounter_Single = document.getElementById('batchFilesCounter_Single');
@@ -121,10 +168,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 3. ИНИЦИАЛИЗАЦИЯ
   // ============================================
   
-  const data = await chrome.storage.local.get(['tabVoices', 'customNames', 'extensionEnabled', 'voiceMappings']);
+  const data = await chrome.storage.local.get([
+    'tabVoices',
+    'customNames',
+    'extensionEnabled',
+    'voiceMappings',
+    'multiVoicePrefix',
+    'cachedSiteVoices'
+  ]);
   let extensionEnabled = data.extensionEnabled !== false;
   const customNames = data.customNames || [];
   voiceMappings = data.voiceMappings || {}; 
+  cachedSiteVoices = Array.isArray(data.cachedSiteVoices) ? data.cachedSiteVoices : [];
 
   let tabId = 'fallback-tab';
   try {
@@ -140,6 +195,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   updateToggleSwitch(extensionEnabled);
   updateCounterDisplay();
   initLanguageSelector();
+  if (multiVoicePrefixInput) multiVoicePrefixInput.value = data.multiVoicePrefix || 'mp';
+  renderSiteVoicesStatus(cachedSiteVoices.length ? `Загружено голосов: ${cachedSiteVoices.length}` : 'Нажмите «Обновить», чтобы подтянуть My Voices.', cachedSiteVoices.length ? 'success' : '');
   const automationRunning = await restoreAutomationState();
   await restoreUiState(automationRunning);
   await loadSkippedEntries();
@@ -181,15 +238,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     };
     fillSelect(languageSelect);
-    fillSelect(multiLanguageSelect);
 
-    chrome.storage.local.get(['selectedLanguage', 'selectedMultiLanguage'], (d) => {
+    chrome.storage.local.get(['selectedLanguage'], (d) => {
         if (d.selectedLanguage && languageSelect) languageSelect.value = d.selectedLanguage;
-        if (d.selectedMultiLanguage && multiLanguageSelect) multiLanguageSelect.value = d.selectedMultiLanguage;
     });
 
     if(languageSelect) languageSelect.addEventListener('change', () => chrome.storage.local.set({ selectedLanguage: languageSelect.value }));
-    if(multiLanguageSelect) multiLanguageSelect.addEventListener('change', () => chrome.storage.local.set({ selectedMultiLanguage: multiLanguageSelect.value }));
   }
 
   function collectUiState() {
@@ -202,6 +256,234 @@ document.addEventListener('DOMContentLoaded', async () => {
           pasteModeSingle: pasteModeSingle?.style.display === 'block',
           pasteModeMulti: pasteModeMulti?.style.display === 'block'
       };
+  }
+
+  function renderSiteVoicesStatus(message, type = '') {
+      if (!siteVoicesStatus) return;
+      siteVoicesStatus.textContent = message || '';
+      siteVoicesStatus.className = `voice-source-status${type ? ` ${type}` : ''}`;
+  }
+
+  function normalizeLookupText(value) {
+      return String(value || '')
+          .toLowerCase()
+          .replace(/[_-]+/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+  }
+
+  function getVoiceMappingKey(speaker, languageCode = '') {
+      const normalizedSpeaker = String(speaker || '').trim();
+      const normalizedLanguage = String(languageCode || '').trim().toUpperCase();
+      return normalizedLanguage ? `${normalizedLanguage}::${normalizedSpeaker}` : normalizedSpeaker;
+  }
+
+  function getVoiceMappingValue(speaker, languageCode = '') {
+      const scopedKey = getVoiceMappingKey(speaker, languageCode);
+      return voiceMappings[scopedKey] || voiceMappings[String(speaker || '').trim()] || '';
+  }
+
+  function getEntryLanguageCode(entry, file = null) {
+      const entryCode = String(entry?.languageCode || '').trim().toUpperCase();
+      if (entryCode) return entryCode;
+      return String(file?.languageCode || '').trim().toUpperCase();
+  }
+
+  function getEntryMinimaxLanguage(entry, file = null) {
+      const fromFile = normalizeMinimaxLanguage(file?.language || '');
+      if (fromFile) return fromFile;
+      const explicit = normalizeMinimaxLanguage(entry?.minimaxLanguage || '');
+      if (explicit) return explicit;
+      const fromEntryCode = resolveMinimaxLanguageFromCode(getEntryLanguageCode(entry, file));
+      if (fromEntryCode) return fromEntryCode;
+      return getDefaultMultiLanguage();
+  }
+
+  function getFileLanguageSummary(file) {
+      const codes = new Set();
+      const minimaxLanguages = new Set();
+
+      (file?.entries || []).forEach((entry) => {
+          const code = getEntryLanguageCode(entry, file);
+          const lang = getEntryMinimaxLanguage(entry, file);
+          if (code) codes.add(code);
+          if (lang) minimaxLanguages.add(lang);
+      });
+
+      return {
+          codes: [...codes],
+          minimaxLanguages: [...minimaxLanguages],
+          isMixed: codes.size > 1 || minimaxLanguages.size > 1
+      };
+  }
+
+  function inferVoiceRoleTokens(speaker) {
+      const normalized = normalizeLookupText(speaker);
+      const numberMatch = normalized.match(/\b(\d+)\b/);
+      const number = numberMatch ? numberMatch[1] : '';
+
+      if (/\b(doc|doctor|доктор)\b/.test(normalized)) {
+          return [['doc'], ['doctor'], ['доктор']];
+      }
+      if (/\b(dic|dictor|диктор|репортер|reporter)\b/.test(normalized)) {
+          return [['dic'], ['dictor'], ['диктор'], ['репортер'], ['reporter']];
+      }
+
+      const tokenSets = [];
+      if (/\bмуж(чина)?\b/.test(normalized)) {
+          if (number) tokenSets.push(['отзыв', 'мужчина', number], ['мужчина', number]);
+          tokenSets.push(['мужчина']);
+      }
+      if (/\bжен(щина)?\b/.test(normalized)) {
+          if (number) tokenSets.push(['отзыв', 'женщина', number], ['женщина', number]);
+          tokenSets.push(['женщина']);
+      }
+      if (number) tokenSets.push(['отзыв', number]);
+
+      const genericTokens = normalized.split(' ').filter(Boolean);
+      if (genericTokens.length) {
+          tokenSets.push(genericTokens);
+      }
+      return tokenSets;
+  }
+
+  function findBestCachedVoiceMatch(speaker, languageCode = '') {
+      if (!Array.isArray(cachedSiteVoices) || cachedSiteVoices.length === 0) return '';
+
+      const prefix = normalizeLookupText(multiVoicePrefixInput?.value || 'mp');
+      const normalizedLanguage = normalizeLookupText(languageCode);
+      const baseTokens = [prefix];
+      if (normalizedLanguage) baseTokens.push(normalizedLanguage);
+
+      const candidateTokenSets = inferVoiceRoleTokens(speaker).map(tokens => [...baseTokens, ...tokens]);
+      const normalizedVoices = cachedSiteVoices.map(voiceName => ({
+          original: voiceName,
+          normalized: normalizeLookupText(voiceName)
+      }));
+
+      for (const tokenSet of candidateTokenSets) {
+          const match = normalizedVoices.find(voice =>
+              tokenSet.every(token => voice.normalized.includes(normalizeLookupText(token)))
+          );
+          if (match) return match.original;
+      }
+
+      return '';
+  }
+
+  function ensureAutoVoiceMappings() {
+      let changed = false;
+
+      batchFiles_Multi.forEach(file => {
+          file.entries.forEach(entry => {
+              const languageCode = getEntryLanguageCode(entry, file);
+              const existingValue = getVoiceMappingValue(entry.speaker, languageCode);
+              if (existingValue) return;
+
+              const matchedVoice = findBestCachedVoiceMatch(entry.speaker, languageCode);
+              if (!matchedVoice) return;
+
+              const scopedKey = getVoiceMappingKey(entry.speaker, languageCode);
+              voiceMappings[scopedKey] = matchedVoice;
+              changed = true;
+          });
+      });
+
+      if (changed) {
+          chrome.storage.local.set({ voiceMappings });
+          saveState();
+          saveBatchFiles();
+      }
+  }
+
+  function applyVoiceMappingValue(speaker, rawValue, languageCode = '') {
+      const value = String(rawValue || '').trim();
+      const scopedKey = getVoiceMappingKey(speaker, languageCode);
+      voiceMappings[scopedKey] = value;
+
+      batchFiles_Multi.forEach(file => {
+          const fileLanguageCode = String(file.languageCode || '').trim().toUpperCase();
+          if (String(languageCode || '').trim().toUpperCase() && fileLanguageCode !== String(languageCode || '').trim().toUpperCase()) {
+              return;
+          }
+          const speakerEntryIds = file.entries
+              .filter(entry => entry.speaker === speaker)
+              .map(entry => entry.id);
+
+          if (value) {
+              speakerEntryIds.forEach(id => file.excludedIds.delete(id));
+          } else {
+              speakerEntryIds.forEach(id => file.excludedIds.add(id));
+          }
+      });
+
+      chrome.storage.local.set({ voiceMappings });
+      saveState();
+      saveBatchFiles();
+      renderBatchFilesList('multi');
+  }
+
+  async function fetchSiteVoices() {
+      renderSiteVoicesStatus('Читаю My Voices со страницы MiniMax...');
+      if (refreshSiteVoicesButton) refreshSiteVoicesButton.disabled = true;
+
+      try {
+          const prefix = String(multiVoicePrefixInput?.value || 'mp').trim();
+          await chrome.storage.local.set({ multiVoicePrefix: prefix });
+
+          const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+          const activeTab = tabs[0];
+          if (!activeTab?.id || !String(activeTab.url || '').startsWith('https://www.minimax.io/')) {
+              renderSiteVoicesStatus('Откройте активной вкладку MiniMax TTS и нажмите «Обновить».', 'error');
+              return;
+          }
+
+          const response = await chrome.tabs.sendMessage(activeTab.id, {
+              action: 'listVoicesFromUi',
+              prefix
+          }).catch((error) => ({
+              success: false,
+              reason: error?.message || 'content_script_unavailable'
+          }));
+
+          if (!response?.success) {
+              renderSiteVoicesStatus(`Не удалось прочитать My Voices: ${response?.reason || 'unknown error'}`, 'error');
+              return;
+          }
+
+          cachedSiteVoices = Array.isArray(response.voices) ? response.voices : [];
+          await chrome.storage.local.set({ cachedSiteVoices });
+          renderSiteVoicesStatus(
+              cachedSiteVoices.length
+                  ? `Загружено голосов: ${cachedSiteVoices.length}`
+                  : `По префиксу "${prefix || 'без фильтра'}" ничего не найдено.`,
+              cachedSiteVoices.length ? 'success' : ''
+          );
+
+          if (batchFiles_Multi.length) {
+              renderMultiVoiceUI();
+          }
+      } finally {
+          if (refreshSiteVoicesButton) refreshSiteVoicesButton.disabled = false;
+      }
+  }
+
+  function getDefaultMultiLanguage() {
+      return DEFAULT_MULTI_LANGUAGE;
+  }
+
+  function createLanguageSelectElement(currentValue, onChange) {
+      const select = document.createElement('select');
+      select.className = 'input';
+      AVAILABLE_LANGUAGES.forEach((lang) => {
+          const option = document.createElement('option');
+          option.value = lang;
+          option.textContent = lang;
+          if (lang === currentValue) option.selected = true;
+          select.appendChild(option);
+      });
+      select.addEventListener('change', onChange);
+      return select;
   }
 
   function scheduleSaveUiState() {
@@ -393,6 +675,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   uploadButton.addEventListener('click', () => scriptFile.click());
   multiUploadButton.addEventListener('click', () => multiScriptFile.click());
+  if (refreshSiteVoicesButton) refreshSiteVoicesButton.addEventListener('click', fetchSiteVoices);
 
   scriptFile.addEventListener('change', (e) => { handleMultipleFiles(e.target.files, 'single'); e.target.value = ''; });
   multiScriptFile.addEventListener('change', (e) => { handleMultipleFiles(e.target.files, 'multi'); e.target.value = ''; });
@@ -417,12 +700,19 @@ document.addEventListener('DOMContentLoaded', async () => {
       for (let i = 0; i < fileArray.length; i++) {
         const text = await fileArray[i].text();
         const entries = parseMarkdownText(text);
+        const metadata = extractScriptMetadata(text, fileArray[i].name);
+        const displayName = buildDisplayFileName(fileArray[i].name, metadata.scriptName);
+        if (metadata.minimaxLanguage) {
+          applyDetectedSingleLanguage(metadata.minimaxLanguage);
+        }
         if (entries.length) {
           batchFiles_Single.push({
-            name: fileArray[i].name,
+            name: displayName,
+            scriptName: metadata.scriptName,
             entries: entries,
             selectedSpeaker: null,
-            excludedIds: new Set()
+            excludedIds: new Set(),
+            languageCode: metadata.languageCode || ''
           });
         }
       }
@@ -554,12 +844,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (!file) return;
     try {
       const text = await file.text();
-      if (isBatchAdd) await addBatchFile(file.name, text, mode);
-      else processScriptContent(text, file.name, mode);
+      const metadata = extractScriptMetadata(text, file.name);
+      const displayName = buildDisplayFileName(file.name, metadata.scriptName);
+      if (mode === 'single' && metadata.minimaxLanguage) {
+        applyDetectedSingleLanguage(metadata.minimaxLanguage);
+      }
+      if (isBatchAdd) await addBatchFile(displayName, text, mode, metadata);
+      else processScriptContent(text, displayName, mode, metadata);
     } catch (e) { console.error(e); showStatus('Ошибка чтения', 'error'); }
   }
 
-  async function addBatchFile(filename, text, mode) {
+  async function addBatchFile(filename, text, mode, metadata = null) {
     const entries = parseMarkdownText(text);
     if (!entries.length) return showStatus('Реплики не найдены', 'error');
 
@@ -573,8 +868,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
-    const batchData = { name: filename, entries: entries, excludedIds: new Set(), expanded: false };
+    const batchData = {
+      name: filename,
+      scriptName: metadata?.scriptName || getScriptNameForNaming(filename),
+      entries: entries,
+      excludedIds: new Set(),
+      expanded: false,
+      language: mode === 'multi' ? (metadata?.minimaxLanguage || getDefaultMultiLanguage()) : undefined,
+      languageCode: metadata?.languageCode || ''
+    };
     if (mode === 'single') {
+        if (metadata?.minimaxLanguage) applyDetectedSingleLanguage(metadata.minimaxLanguage);
         // Logic kept simple for brevity
         batchData.selectedSpeaker = selectedSpeaker || Object.keys(getStatistics(entries))[0];
         batchFiles_Single.push(batchData);
@@ -672,13 +976,43 @@ document.addEventListener('DOMContentLoaded', async () => {
       expandDiv.style.marginTop = '10px';
 
       if (!isSingle) {
+        const fileLanguageSummary = getFileLanguageSummary(file);
+        const languageRow = document.createElement('div');
+        languageRow.style.cssText = 'display:flex; align-items:center; gap:8px; margin-bottom:8px;';
+
+        const languageLabel = document.createElement('div');
+        languageLabel.style.cssText = 'font-size:11px; color:var(--md-sys-color-on-surface-variant); white-space:nowrap;';
+        languageLabel.textContent = fileLanguageSummary.isMixed ? 'Языки реплик:' : 'Язык файла:';
+
+        if (fileLanguageSummary.isMixed) {
+          const mixedLabel = document.createElement('div');
+          mixedLabel.style.cssText = 'font-size:11px; color:var(--md-sys-color-on-surface-variant);';
+          mixedLabel.textContent = fileLanguageSummary.minimaxLanguages.join(', ') || 'Mixed';
+          languageRow.append(languageLabel, mixedLabel);
+        } else {
+          const languageSelect = createLanguageSelectElement(file.language || fileLanguageSummary.minimaxLanguages[0] || getDefaultMultiLanguage(), (e) => {
+            file.language = e.target.value;
+            saveBatchFiles();
+            saveState();
+          });
+          languageSelect.style.maxWidth = '180px';
+          languageRow.append(languageLabel, languageSelect);
+        }
+        expandDiv.appendChild(languageRow);
+
         const voiceSummary = document.createElement('div');
         voiceSummary.style.cssText = 'font-size:11px; color:var(--md-sys-color-on-surface-variant); margin-bottom:8px; padding:6px; background:rgba(0,0,0,0.2); border-radius:8px;';
         const assignedVoices = [];
-        Object.keys(stats).forEach(speaker => {
-          const voiceId = voiceMappings[speaker];
+        const seenVoiceKeys = new Set();
+        file.entries.forEach(entry => {
+          const entryLanguageCode = getEntryLanguageCode(entry, file);
+          const summaryKey = `${entryLanguageCode}::${entry.speaker}`;
+          if (seenVoiceKeys.has(summaryKey)) return;
+          seenVoiceKeys.add(summaryKey);
+          const voiceId = getVoiceMappingValue(entry.speaker, entryLanguageCode);
           if (voiceId) {
-            assignedVoices.push(`${speaker}: ${voiceId}`);
+            const label = entryLanguageCode ? `[${entryLanguageCode}] ${entry.speaker}` : entry.speaker;
+            assignedVoices.push(`${label}: ${voiceId}`);
           }
         });
         voiceSummary.textContent = assignedVoices.length > 0 
@@ -695,16 +1029,20 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
 
       let missingSpeakers = new Set();
+      let missingSpeakerKeys = new Set();
       let missingEntries = [];
       let selectableEntries = entriesForPreview;
       if (!isSingle) {
         file.entries.forEach(entry => {
-            if (!voiceMappings[entry.speaker] || !voiceMappings[entry.speaker].trim()) {
+            const entryLanguageCode = getEntryLanguageCode(entry, file);
+            const mappingKey = getVoiceMappingKey(entry.speaker, entryLanguageCode);
+            if (!getVoiceMappingValue(entry.speaker, entryLanguageCode).trim()) {
                 missingSpeakers.add(entry.speaker);
+                missingSpeakerKeys.add(mappingKey);
             }
         });
-        missingEntries = file.entries.filter(e => missingSpeakers.has(e.speaker));
-        selectableEntries = file.entries.filter(e => !missingSpeakers.has(e.speaker));
+        missingEntries = file.entries.filter(e => missingSpeakerKeys.has(getVoiceMappingKey(e.speaker, getEntryLanguageCode(e, file))));
+        selectableEntries = file.entries.filter(e => !missingSpeakerKeys.has(getVoiceMappingKey(e.speaker, getEntryLanguageCode(e, file))));
         missingEntries.forEach(e => file.excludedIds.add(e.id));
       }
 
@@ -749,7 +1087,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (!speakerCounters[entry.speaker]) speakerCounters[entry.speaker] = 0;
             speakerCounters[entry.speaker]++;
             const card = createCard(entry, speakerCounters[entry.speaker], file.excludedIds, !isSingle, voiceMappings, {
-                missingVoice: !isSingle && missingSpeakers.has(entry.speaker)
+                missingVoice: !isSingle && missingSpeakerKeys.has(getVoiceMappingKey(entry.speaker, getEntryLanguageCode(entry, file)))
             });
             previewDiv.appendChild(card);
         });
@@ -850,6 +1188,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if(d.batchFiles_Multi) {
         batchFiles_Multi = d.batchFiles_Multi.map(f => ({
           ...f, 
+          language: f.language || getDefaultMultiLanguage(),
           excludedIds: new Set(f.excludedIds||[])
         }));
         renderBatchFilesList('multi');
@@ -899,14 +1238,25 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (automationControlsCard) automationControlsCard.style.display = 'none';
   }
 
-  function processScriptContent(text, filenameStr, mode) {
+  function processScriptContent(text, filenameStr, mode, metadata = null) {
     const nameDisplay = mode === 'single' ? fileName : multiFileName;
     nameDisplay.textContent = filenameStr;
     const entries = parseMarkdownText(text);
     if (!entries.length) return showStatus('Реплики не найдены', 'error');
+    const resolvedMetadata = metadata || extractScriptMetadata(text, filenameStr);
+    const resolvedScriptName = resolvedMetadata.scriptName;
 
     if (mode === 'single') {
+        if (resolvedMetadata.minimaxLanguage) applyDetectedSingleLanguage(resolvedMetadata.minimaxLanguage);
         parsedEntries = entries;
+        batchFiles_Single = [{
+            name: filenameStr,
+            scriptName: resolvedScriptName,
+            entries: entries,
+            selectedSpeaker: null,
+            excludedIds: new Set(),
+            languageCode: resolvedMetadata.languageCode || ''
+        }];
         addFileButton_Single.style.display = 'flex';
         batchFilesContainer_Single.style.display = 'block';
         selectedSpeaker = null;
@@ -919,18 +1269,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Для мульти-режима - добавляем файл в очередь без перезаписи parsedEntries
         const newFile = {
             name: filenameStr,
+            scriptName: resolvedScriptName,
             entries: entries,
             excludedIds: new Set(),  // Каждый файл имеет свой набор исключений
-            expanded: false
+            expanded: false,
+            language: resolvedMetadata.minimaxLanguage || getDefaultMultiLanguage(),
+            languageCode: resolvedMetadata.languageCode || ''
         };
         batchFiles_Multi.push(newFile);
-        
-        // Обновляем глобальные voiceMappings если появились новые спикеры
-        entries.forEach(entry => {
-          if (!voiceMappings[entry.speaker]) {
-            voiceMappings[entry.speaker] = '';
-          }
-        });
         
         // Обновляем UI
         renderMultiVoiceUI();
@@ -1000,73 +1346,99 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Multi UI - Глобальный модуль голосов для всех файлов
   function renderMultiVoiceUI() {
-    // Собираем уникальных спикеров из ВСЕХ файлов
-    const allSpeakers = new Set();
-    batchFiles_Multi.forEach(file => {
-      file.entries.forEach(entry => allSpeakers.add(entry.speaker));
-    });
-    
-    if (allSpeakers.size === 0) return;
-    
-    voiceMappingList.innerHTML = '';
-    
-    // Считаем статистику по всем файлам
-    const stats = {};
+    ensureAutoVoiceMappings();
+
+    // Собираем уникальные пары язык + спикер из всех файлов
+    const mappingItems = new Map();
     batchFiles_Multi.forEach(file => {
       file.entries.forEach(entry => {
-        stats[entry.speaker] = (stats[entry.speaker] || 0) + 1;
+        const languageCode = getEntryLanguageCode(entry, file);
+        const minimaxLanguage = getEntryMinimaxLanguage(entry, file);
+        const mappingKey = getVoiceMappingKey(entry.speaker, languageCode);
+        if (!mappingItems.has(mappingKey)) {
+          mappingItems.set(mappingKey, {
+            mappingKey,
+            speaker: entry.speaker,
+            languageCode,
+            minimaxLanguage,
+            count: 0
+          });
+        }
+        mappingItems.get(mappingKey).count += 1;
       });
     });
     
-    [...allSpeakers].sort().forEach(speaker => {
+    if (mappingItems.size === 0) return;
+    
+    voiceMappingList.innerHTML = '';
+
+    [...mappingItems.values()]
+      .sort((a, b) => {
+        const left = `${a.languageCode} ${a.speaker}`.trim().toLowerCase();
+        const right = `${b.languageCode} ${b.speaker}`.trim().toLowerCase();
+        return left.localeCompare(right, 'ru');
+      })
+      .forEach(item => {
+      const speakerKey = `${item.languageCode}-${item.speaker}`
+        .toLowerCase()
+        .replace(/[^a-z0-9а-яё]+/gi, '-')
+        .replace(/^-+|-+$/g, '') || 'speaker';
+      const datalistId = `siteVoiceOptions-${speakerKey}`;
+      const currentValue = getVoiceMappingValue(item.speaker, item.languageCode);
       const div = document.createElement('div');
       div.className = 'voice-mapping-item';
+      const autoMatchedVoice = currentValue || findBestCachedVoiceMatch(item.speaker, item.languageCode);
+      const languageBadge = item.languageCode
+        ? ` <span class="voice-mapping-count">[${item.languageCode}${item.minimaxLanguage ? ` / ${item.minimaxLanguage}` : ''}]</span>`
+        : '';
       
       div.innerHTML = `
         <div class="voice-mapping-info">
-            <span class="voice-mapping-label">${speaker}</span>
-            <span class="voice-mapping-count">${stats[speaker] || 0} реплик</span>
+            <span class="voice-mapping-label">${item.speaker}</span>${languageBadge}
+            <span class="voice-mapping-count">${item.count || 0} реплик</span>
         </div>
       `;
       
       const input = document.createElement('input');
       input.className = 'voice-mapping-input';
-      input.placeholder = 'Moss ID / Voice Name...';
-      input.value = voiceMappings[speaker] || '';
-      
-      // === ИСПРАВЛЕНИЕ: Автоматическое включение/выключение реплик ===
-      input.oninput = (e) => {
-          const value = e.target.value.trim();
-          voiceMappings[speaker] = value;
-          
-          // Автоматическое включение/выключение реплик
-          // Если ID введен -> включаем (убираем из excluded)
-          // Если ID стерт -> выключаем (добавляем в excluded)
-          batchFiles_Multi.forEach(file => {
-              // Находим все ID реплик этого спикера в файле
-              const speakerEntryIds = file.entries
-                  .filter(entry => entry.speaker === speaker)
-                  .map(entry => entry.id);
-                  
-              if (value) {
-                  // Если ID есть, делаем их активными (удаляем из исключений)
-                  speakerEntryIds.forEach(id => file.excludedIds.delete(id));
-              } else {
-                  // Если ID стерли, делаем неактивными (добавляем в исключения)
-                  speakerEntryIds.forEach(id => file.excludedIds.add(id));
-              }
-          });
+      input.placeholder = cachedSiteVoices.length ? 'Выберите голос из My Voices...' : 'Сначала нажмите «Обновить»';
+      input.value = currentValue;
+      input.setAttribute('list', datalistId);
+      if (autoMatchedVoice && !currentValue) {
+          input.placeholder = `Автоподбор: ${autoMatchedVoice}`;
+      }
 
-          chrome.storage.local.set({voiceMappings});
-          saveState();
-          saveBatchFiles();
-          
-          // Перерисовываем список файлов, чтобы галочки обновились
-          renderBatchFilesList('multi');
-      };
-      // ===================================================================
-      
-      div.appendChild(input);
+      const controls = document.createElement('div');
+      controls.className = 'voice-mapping-controls';
+
+      const dataList = document.createElement('datalist');
+      dataList.id = datalistId;
+      cachedSiteVoices.forEach((voiceName) => {
+          const option = document.createElement('option');
+          option.value = voiceName;
+          dataList.appendChild(option);
+      });
+
+      input.addEventListener('change', (e) => {
+          applyVoiceMappingValue(item.speaker, e.target.value, item.languageCode);
+      });
+      input.addEventListener('blur', (e) => {
+          applyVoiceMappingValue(item.speaker, e.target.value, item.languageCode);
+      });
+
+      const clearButton = document.createElement('button');
+      clearButton.type = 'button';
+      clearButton.className = 'btn btn-outline voice-mapping-clear';
+      clearButton.textContent = 'Очистить';
+      clearButton.addEventListener('click', () => {
+          input.value = '';
+          applyVoiceMappingValue(item.speaker, '', item.languageCode);
+      });
+
+      controls.appendChild(input);
+      controls.appendChild(clearButton);
+      div.appendChild(controls);
+      div.appendChild(dataList);
       voiceMappingList.appendChild(div);
     });
     multiConfigContainer.style.display = 'block';
@@ -1168,6 +1540,58 @@ document.addEventListener('DOMContentLoaded', async () => {
       return fileNameText.replace(/\.(md|txt)$/i, '');
   }
 
+  function normalizeMinimaxLanguage(value) {
+      const normalized = String(value || '').trim();
+      if (!normalized) return '';
+      const directMatch = AVAILABLE_LANGUAGES.find(lang => lang.toLowerCase() === normalized.toLowerCase());
+      return directMatch || '';
+  }
+
+  function resolveMinimaxLanguageFromCode(languageCode) {
+      const normalizedCode = String(languageCode || '').trim().toUpperCase();
+      if (!normalizedCode) return '';
+      return normalizeMinimaxLanguage(LANGUAGE_CODE_TO_MINIMAX[normalizedCode] || '');
+  }
+
+  function extractScriptMetadata(text, fallbackName = null) {
+      const source = String(text || '');
+      const scriptNameMatch = source.match(/<!--\s*script_name\s*:\s*(.+?)\s*-->/i);
+      const minimaxLanguageMatch = source.match(/<!--\s*minimax_language\s*:\s*(.+?)\s*-->/i);
+      const languageCodeMatch = source.match(/<!--\s*(?:language_code|target_language_code)\s*:\s*(.+?)\s*-->/i);
+
+      const scriptName = scriptNameMatch && scriptNameMatch[1]
+          ? scriptNameMatch[1].trim()
+          : getScriptNameForNaming(fallbackName);
+      const languageCode = languageCodeMatch && languageCodeMatch[1]
+          ? languageCodeMatch[1].trim().toUpperCase()
+          : '';
+      const minimaxLanguage =
+          normalizeMinimaxLanguage(minimaxLanguageMatch && minimaxLanguageMatch[1] ? minimaxLanguageMatch[1] : '') ||
+          resolveMinimaxLanguageFromCode(languageCode);
+
+      return {
+          scriptName,
+          languageCode,
+          minimaxLanguage
+      };
+  }
+
+  function applyDetectedSingleLanguage(minimaxLanguage) {
+      const resolved = normalizeMinimaxLanguage(minimaxLanguage);
+      if (!resolved || !languageSelect) return;
+      languageSelect.value = resolved;
+      chrome.storage.local.set({ selectedLanguage: resolved });
+  }
+
+  function buildDisplayFileName(originalFileName, scriptName) {
+      const extensionMatch = String(originalFileName || '').match(/(\.[^.]+)$/);
+      const extension = extensionMatch ? extensionMatch[1] : '.md';
+      if (scriptName) {
+          return `${scriptName}${extension}`;
+      }
+      return originalFileName;
+  }
+
   startAutomationButton.onclick = async () => {
       activeMode = 'single';
       if (batchFiles_Single.length === 0) return showStatus('Нет файлов', 'error');
@@ -1180,8 +1604,12 @@ document.addEventListener('DOMContentLoaded', async () => {
           const entriesToProcess = batchFile.entries.filter(e => e.speaker.toLowerCase().trim() === fileSpeaker.toLowerCase().trim());
           if (entriesToProcess.length === 0) continue;
           
-          const scriptName = getScriptNameForNaming(batchFile.name);
-          const queue = prepareQueue(entriesToProcess, batchFile.excludedIds, false, scriptName);
+          const scriptName = batchFile.scriptName || getScriptNameForNaming(batchFile.name);
+          const queue = prepareQueue(entriesToProcess, batchFile.excludedIds, {
+              useVoiceMap: false,
+              scriptName,
+              downloadLayout: 'default'
+          });
           queue.forEach(q => { q.language = languageSelect.value; q.scriptName = scriptName; });
           batchJobs.push({ queue, mode: 'single', scriptName });
       }
@@ -1208,17 +1636,29 @@ document.addEventListener('DOMContentLoaded', async () => {
       const batchJobs = [];
       for (let i = 0; i < batchFiles_Multi.length; i++) {
           const file = batchFiles_Multi[i];
-          const scriptName = getScriptNameForNaming(file.name);
-          const queue = prepareQueue(file.entries, file.excludedIds, true, scriptName);
+          const scriptName = file.scriptName || getScriptNameForNaming(file.name);
+          const queue = prepareQueue(file.entries, file.excludedIds, {
+              useVoiceMap: true,
+              scriptName,
+              downloadLayout: 'package',
+              languageCode: file.languageCode || '',
+              defaultLanguage: file.language || getDefaultMultiLanguage()
+          });
           if (queue.length === 0) continue;
-          queue.forEach(q => q.language = multiLanguageSelect.value); // Use Multi Language
           
-          // Check missing - используем глобальные voiceMappings
-          const activeSpeakers = [...new Set(queue.map(e => e.speaker))];
-          const missing = activeSpeakers.filter(s => !voiceMappings[s] || !voiceMappings[s].trim());
+          const missingMap = new Map();
+          queue.forEach((entry) => {
+              if (entry.voiceId) return;
+              const key = getVoiceMappingKey(entry.speaker, entry.languageCode || '');
+              if (!missingMap.has(key)) {
+                  const label = entry.languageCode ? `[${entry.languageCode}] ${entry.speaker}` : entry.speaker;
+                  missingMap.set(key, label);
+              }
+          });
+          const missing = [...missingMap.values()];
           if (missing.length && !confirm(`Файл "${file.name}"\nНет голоса для: ${missing.join(', ')}. Продолжить?`)) return;
-          
-          queue.sort((a, b) => a.speaker.localeCompare(b.speaker) || a.speakerIndex - b.speakerIndex);
+
+          queue.sort((a, b) => (a.downloadIndex || 0) - (b.downloadIndex || 0));
           batchJobs.push({ queue, mode: 'multi', scriptName });
       }
 
@@ -1259,18 +1699,35 @@ document.addEventListener('DOMContentLoaded', async () => {
       showStatus('Всё сброшено', 'success');
   };
 
-  function prepareQueue(items, exclusionSet, useVoiceMap = false, scriptName = null) {
+  function prepareQueue(items, exclusionSet, options = {}) {
+      const useVoiceMap = !!options.useVoiceMap;
+      const scriptName = options.scriptName || null;
+      const downloadLayout = options.downloadLayout || 'default';
+      const fallbackLanguageCode = String(options.languageCode || '').trim().toUpperCase();
+      const defaultLanguage = options.defaultLanguage || getDefaultMultiLanguage();
+      const languageContext = {
+          languageCode: fallbackLanguageCode,
+          language: defaultLanguage
+      };
       const speakerCounters = {};
+      let globalCounter = 0;
       return items
           .filter(entry => !exclusionSet.has(entry.id))
           .map(entry => {
+              const entryLanguageCode = getEntryLanguageCode(entry, languageContext) || fallbackLanguageCode;
+              const entryLanguage = getEntryMinimaxLanguage(entry, languageContext) || defaultLanguage;
               if(!speakerCounters[entry.speaker]) speakerCounters[entry.speaker] = 0;
               speakerCounters[entry.speaker]++;
+              globalCounter++;
               return {
                   ...entry,
                   speakerIndex: speakerCounters[entry.speaker],
-                  voiceId: useVoiceMap ? (voiceMappings[entry.speaker] || null) : null,
-                  scriptName: scriptName
+                  downloadIndex: downloadLayout === 'package' ? globalCounter : speakerCounters[entry.speaker],
+                  voiceId: useVoiceMap ? (getVoiceMappingValue(entry.speaker, entryLanguageCode) || null) : null,
+                  scriptName: scriptName,
+                  downloadLayout,
+                  languageCode: entryLanguageCode,
+                  language: entryLanguage
               };
           });
   }

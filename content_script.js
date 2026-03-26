@@ -36,6 +36,73 @@ function isValidDownloadLink(url) {
   return url.includes('cdn.hailuoai.video') || url.includes('minimax.io'); 
 }
 
+function isVisibleElement(el) {
+  if (!el) return false;
+  const style = window.getComputedStyle(el);
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = el.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+
+function findMp3OptionInOpenDropdown() {
+  const dropdowns = Array.from(document.querySelectorAll('.ant-dropdown, [role="menu"]'))
+    .filter((el) => isVisibleElement(el) && !el.classList.contains('ant-dropdown-hidden'));
+
+  for (const dropdown of dropdowns) {
+    const items = Array.from(dropdown.querySelectorAll('li[role="menuitem"], .ant-dropdown-menu-item, [role="menuitem"]'));
+    if (!items.length) continue;
+
+    let mp3Item = items.find((item) => {
+      const dataMenuId = String(item.getAttribute('data-menu-id') || '').toLowerCase();
+      return dataMenuId.includes('tts_no_watermark') && !dataMenuId.includes('wav');
+    });
+
+    if (!mp3Item) {
+      mp3Item = items.find((item) => {
+        const text = String(item.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        return text.includes('mp3');
+      });
+    }
+
+    if (mp3Item) return mp3Item;
+  }
+
+  return null;
+}
+
+async function clickMp3FromDownloadMenu(maxWaitMs = 4000, intervalMs = 120) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < maxWaitMs) {
+    const mp3Item = findMp3OptionInOpenDropdown();
+    if (mp3Item) {
+      mp3Item.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+      mp3Item.click();
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return false;
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error || new Error('Failed to read blob'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function sanitizeFilenamePart(value) {
+  return String(value || '')
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/\.{2,}/g, '_')
+    .replace(/^\.+/, '')
+    .replace(/\.+$/, '')
+    .replace(/\s+/g, '_')
+    .slice(0, 100);
+}
+
 let lastClickTime = 0;
 const CLICK_DEBOUNCE_MS = 300;
 
@@ -173,6 +240,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     });
     return true;
   }
+  if (request.action === 'listVoicesFromUi') {
+    if (!automation) automation = new VoiceoverAutomation();
+    automation.listVoicesFromUi(request.prefix || '').then((result) => {
+      sendResponse({
+        success: !!result?.ok,
+        voices: Array.isArray(result?.voices) ? result.voices : [],
+        reason: result?.reason || null
+      });
+    }).catch((error) => {
+      sendResponse({
+        success: false,
+        voices: [],
+        reason: error?.message || 'list_voices_from_ui_failed'
+      });
+    });
+    return true;
+  }
 });
 
 class VoiceoverAutomation {
@@ -190,7 +274,7 @@ class VoiceoverAutomation {
         this.selectors = {
             textarea: '[data-slate-editor="true"]',
             switchVoiceBtnXPath: '//div[contains(@class, "flex") and .//path[starts-with(@d, "M5.24492 3.34774")]',
-            searchVoiceInput: 'input[placeholder*="Search"]',
+            searchVoiceInput: 'input[placeholder*="Search"], input[placeholder*="voices"], input[placeholder*="Voices"]',
             useVoiceBtnXPath: '//div[contains(text(), "Use") and contains(@class, "ant-btn")]',
             closeModalBtnXPath: '//span[contains(@class, "anticon-close")]',
             languageDropdownTrigger: '.language-select .ant-select-selector',
@@ -206,6 +290,31 @@ class VoiceoverAutomation {
 
     setScriptName(name) {
         this.scriptName = name;
+    }
+
+    buildExpectedOutputInfo(entry) {
+        const downloadLayout = String(entry.downloadLayout || '').trim().toLowerCase();
+        const folderBase = sanitizeFilenamePart(entry.scriptName || this.scriptName || entry.speaker || 'dictor');
+        const speakerBase = sanitizeFilenamePart(entry.speaker || entry.originalTag || 'dictor');
+        const fileNumber = Number(entry.downloadIndex || entry.speakerIndex || 1);
+
+        if (downloadLayout === 'package') {
+            const paddedNumber = String(fileNumber).padStart(3, '0');
+            return {
+                folderName: folderBase || speakerBase || 'dictor',
+                fileNamePrefix: speakerBase || 'dictor',
+                fullFileName: `${folderBase || speakerBase || 'dictor'}/${paddedNumber}__${speakerBase || 'dictor'}.mp3`
+            };
+        }
+
+        const paddedNumber = String(fileNumber).padStart(4, '0');
+        const folderName = this.scriptName ? `${folderBase} - ${speakerBase}` : speakerBase;
+        const fileNamePrefix = this.scriptName ? `${folderBase} - ${speakerBase}` : speakerBase;
+        return {
+            folderName,
+            fileNamePrefix,
+            fullFileName: `${folderName}/${paddedNumber}_${fileNamePrefix}.mp3`
+        };
     }
 
     setQueue(entries) {
@@ -268,6 +377,57 @@ class VoiceoverAutomation {
         }
 
         return false;
+    }
+
+    installStealthVoiceModalStyle() {
+        const style = document.createElement('style');
+        style.setAttribute('data-minimax-voice-modal-stealth', 'true');
+        style.textContent = `
+            .ant-modal-root,
+            .ant-modal-wrap,
+            .ant-modal-mask {
+                opacity: 0 !important;
+                animation: none !important;
+                transition: none !important;
+            }
+        `;
+        (document.head || document.documentElement).appendChild(style);
+        return () => {
+            if (style.parentNode) style.parentNode.removeChild(style);
+        };
+    }
+
+    getVoiceSelectorButton() {
+        const currentVoiceNameEl = document.querySelector('section h4 > span, div.selected-voice-icon h4 > span, div[class*="selected-voice"] h4 > span');
+        if (currentVoiceNameEl) {
+            const clickable = currentVoiceNameEl.closest('[role="button"], button, div.cursor-pointer, div');
+            if (clickable) return clickable;
+        }
+
+        const svgPath = document.querySelector('path[d^="M5.24492 3.34774"]');
+        if (svgPath) {
+            const clickable = svgPath.closest('[role="button"], button, div.cursor-pointer, div.flex, div');
+            if (clickable) return clickable;
+        }
+
+        return null;
+    }
+
+    getVoiceTabButton(label) {
+        const target = String(label || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        return Array.from(document.querySelectorAll('[role="tab"]')).find((tab) => {
+            const text = String(tab.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            return text === target;
+        }) || null;
+    }
+
+    setNativeInputValue(input, value) {
+        if (!input) return;
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+        if (setter) setter.call(input, value);
+        else input.value = value;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
     }
 
     getCurrentVoiceCandidates() {
@@ -342,8 +502,11 @@ class VoiceoverAutomation {
     findVoiceResultCards() {
         const modalRoot = document.querySelector('.ant-modal-root .ant-modal-content, .ant-modal-content, .ant-modal') || document;
         const cards = Array.from(modalRoot.querySelectorAll(
-            '#voice-selection-scroll-list .ant-list-item, #voice-selection-scroll-list > div > div, #voice-selection-scroll-list > div, div.grid > div'
-        ));
+            '[role="tabpanel"] [class*="cursor-pointer"], [role="tabpanel"] [role="button"], [role="tabpanel"] button, #voice-selection-scroll-list .ant-list-item, #voice-selection-scroll-list > div > div, #voice-selection-scroll-list > div, div.grid > div'
+        )).filter((card) => {
+            const text = String(card && card.textContent || '').trim();
+            return text && (card.querySelector('h4') || /use|selected/i.test(text));
+        });
         const unique = [];
         const seen = new Set();
         cards.forEach((card) => {
@@ -352,6 +515,78 @@ class VoiceoverAutomation {
             unique.push(card);
         });
         return unique;
+    }
+
+    extractVoiceNames(cards) {
+        const names = [];
+        const seen = new Set();
+
+        cards.forEach((card) => {
+            const heading = card.querySelector('h4');
+            const voiceName = String(heading?.textContent || '').replace(/\s+/g, ' ').trim();
+            if (!voiceName) return;
+
+            const key = this.normalizeVoiceLabel(voiceName);
+            if (!key || seen.has(key)) return;
+            seen.add(key);
+            names.push(voiceName);
+        });
+
+        return names;
+    }
+
+    async listVoicesFromUi(prefix = '') {
+        const normalizedPrefix = this.normalizeVoiceLabel(prefix);
+        const modalSelector = '.ant-modal-root .ant-modal-content, .ant-modal-content, .ant-modal, [role="dialog"]';
+        let modal = document.querySelector(modalSelector);
+        let openedByScript = false;
+        let removeStealthStyle = null;
+
+        try {
+            if (!modal || !isVisibleElement(modal)) {
+                const switchBtn = this.getVoiceSelectorButton();
+                if (!switchBtn) {
+                    return { ok: false, reason: 'voice_selector_button_not_found', voices: [] };
+                }
+                removeStealthStyle = this.installStealthVoiceModalStyle();
+                switchBtn.click();
+                openedByScript = true;
+                await this.sleep(900);
+                modal = document.querySelector(modalSelector);
+            }
+
+            if (!modal || !isVisibleElement(modal)) {
+                return { ok: false, reason: 'voice_modal_not_visible', voices: [] };
+            }
+
+            const myVoicesTab = this.getVoiceTabButton('My Voices');
+            if (!myVoicesTab) {
+                return { ok: false, reason: 'my_voices_tab_not_found', voices: [] };
+            }
+            if (myVoicesTab.getAttribute('aria-selected') !== 'true') {
+                myVoicesTab.click();
+                await this.sleep(800);
+            }
+
+            const input = await this.waitForElement(this.selectors.searchVoiceInput, 2500);
+            if (input) {
+                this.setNativeInputValue(input, prefix);
+                await this.sleep(1200);
+            }
+
+            const voices = this.extractVoiceNames(this.findVoiceResultCards()).filter((name) => {
+                if (!normalizedPrefix) return true;
+                return this.normalizeVoiceLabel(name).includes(normalizedPrefix);
+            });
+
+            return { ok: true, voices };
+        } finally {
+            if (openedByScript) {
+                this.closeVoiceModal();
+                await this.sleep(120);
+            }
+            if (removeStealthStyle) removeStealthStyle();
+        }
     }
 
     getVoiceActionState(scope) {
@@ -419,25 +654,16 @@ class VoiceoverAutomation {
 
             if (entry.text.length > 5000) {
                 this.log('Skipping text > 5000 chars');
-                
-                // Получаем индекс спикера для имени файла
-                const speakerEntries = this.queue.filter(e => e.speaker === entry.speaker);
-                const speakerIndex = speakerEntries.indexOf(entry) + 1;
-                
-                // Формируем имя по тем же правилам, что и для реальных скачиваний
-                const speakerName = entry.speaker || 'dictor';
-                const paddedNumber = String(speakerIndex).padStart(4, '0');
-                const folderName = this.scriptName ? `${this.scriptName} - ${speakerName}` : speakerName;
-                const fileNamePrefix = folderName;
-                const fullFileName = `${folderName}/${paddedNumber}_${fileNamePrefix}.mp3`;
+                const outputInfo = this.buildExpectedOutputInfo(entry);
                 
                 const skippedEntry = {
                     ...entry,
                     scriptName: this.scriptName,
                     mode: this.mode,
-                    speakerIndex: speakerIndex,
-                    fullFileName: fullFileName,
-                    folderName: folderName
+                    speakerIndex: Number(entry.speakerIndex || 1),
+                    downloadIndex: Number(entry.downloadIndex || entry.speakerIndex || 1),
+                    fullFileName: outputInfo.fullFileName,
+                    folderName: outputInfo.folderName
                 };
                 
                 this.skippedEntries.push(skippedEntry);
@@ -547,6 +773,18 @@ class VoiceoverAutomation {
             await this.waitForButtonState(['regenerate']);
         }
 
+        const captureInstallResult = await this.callBridge('ensureAudioCaptureInstalled');
+        if (!captureInstallResult || !captureInstallResult.ok) {
+            throw new Error(`Audio capture install failed: ${captureInstallResult && captureInstallResult.reason ? captureInstallResult.reason : 'unknown reason'}`);
+        }
+        this.log(captureInstallResult.alreadyInstalled ? 'Audio capture installed (already active)' : 'Audio capture installed');
+
+        const captureResetResult = await this.callBridge('resetAudioCaptureSession');
+        if (!captureResetResult || !captureResetResult.ok) {
+            throw new Error(`Audio capture reset failed: ${captureResetResult && captureResetResult.reason ? captureResetResult.reason : 'unknown reason'}`);
+        }
+        this.log('Audio capture session reset');
+
         generateBtn.click();
         this.log('Clicked Generate');
 
@@ -565,27 +803,27 @@ class VoiceoverAutomation {
             return;
         }
 
-        // Бронируем имя (для Автоматизации)
-        // Используем originalTag если доступен, иначе speaker
         const fileNameBase = entry.originalTag || entry.speaker || 'dictor';
-        
-        const primeRes = await chrome.runtime.sendMessage({
-            action: "primeNextDownload",
+        const captureResult = await this.getCapturedAudioData(12000);
+        this.log(`Audio captured via ${captureResult.source || 'unknown'} (${captureResult.size || 0} bytes)`);
+
+        const downloadRes = await chrome.runtime.sendMessage({
+            action: "downloadAudioData",
+            dataUrl: captureResult.dataUrl,
             voiceName: fileNameBase,
             scriptName: entry.scriptName || null,
-            forceIndex: entry.speakerIndex || null,
-            speakerName: entry.speaker || null  // Передаем имя спикера для группировки по папкам
+            forceIndex: entry.downloadIndex || entry.speakerIndex || null,
+            speakerName: entry.speaker || null,
+            downloadLayout: entry.downloadLayout || null
         });
-        if (!primeRes || !primeRes.success) {
-            throw new Error(`Prime download failed: ${primeRes && primeRes.reason ? primeRes.reason : 'unknown reason'}`);
+        if (!downloadRes || !downloadRes.success) {
+            throw new Error(`Audio download failed: ${downloadRes && downloadRes.reason ? downloadRes.reason : 'unknown reason'}`);
         }
-        this.log(`Primed filename with index: ${primeRes.fileNumber}`);
+        this.log(`Download started (id: ${downloadRes.downloadId || 'n/a'})`);
+        this.log(`Download confirmed (index: ${downloadRes.fileNumber || 'n/a'})`);
 
-        downloadBtn.click();
-        this.log('Clicked Download DIV');
-
-        await this.sleep(1500);
-        // Очистка в конце, чтобы подготовить почву (но insertText тоже очистит)
+          await this.sleep(1500);
+          // Очистка в конце, чтобы подготовить почву (но insertText тоже очистит)
         await this.clearText();
     }
 
@@ -595,13 +833,13 @@ class VoiceoverAutomation {
     // Все операции с Slate state идут через background.js -> chrome.scripting.executeScript с world:'MAIN'.
     // ============================================
 
-    async callBridge(action, text) {
+    async callBridge(action, ...args) {
         // Шлём только имя метода (строку) и аргументы.
         // Сами функции определены в background.js — Chrome не сериализует функции через sendMessage.
         const response = await chrome.runtime.sendMessage({
             action: 'executeInMainWorld',
             method: action,
-            args: text !== undefined ? [text] : []
+            args
         });
 
         if (!response || !response.success) {
@@ -683,8 +921,7 @@ class VoiceoverAutomation {
         let switchBtn = null;
         let attempts = 0;
         while(!switchBtn && attempts < 10) {
-            const svgPath = document.querySelector('path[d^="M5.24492 3.34774"]');
-            if (svgPath) switchBtn = svgPath.closest('div.flex');
+            switchBtn = this.getVoiceSelectorButton();
             if (!switchBtn) {
                  const xpathResult = document.evaluate(this.selectors.switchVoiceBtnXPath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
                 switchBtn = xpathResult.singleNodeValue;
@@ -698,81 +935,72 @@ class VoiceoverAutomation {
         let modalOpened = true;
 
         try {
-            // Определяем формат голоса и переключаем вкладку
-            const isMossId = targetId.startsWith('moss_audio_');
-            const targetTab = isMossId ? 'MyVoices' : 'Library';
-            
-            this.log(`Detected voice format: ${isMossId ? 'moss_id' : 'library'}, switching to tab: ${targetTab}`);
-            
-            const tabXPath = `//div[@role="tab" and @id[contains(., "${targetTab}")]]`;
-            const tabButton = this.getElementByXPath(tabXPath);
-            
-            if (tabButton && !tabButton.classList.contains('ant-tabs-tab-active')) {
-                this.log(`Switching to ${targetTab} tab...`);
-                tabButton.click();
-                await this.sleep(1000);
+            const targetTabs = targetId.startsWith('moss_audio_') ? ['My Voices'] : ['My Voices', 'Library'];
+            let applied = false;
+
+            for (const targetTab of targetTabs) {
+                let tabButton = this.getVoiceTabButton(targetTab);
+                if (!tabButton) {
+                    const legacyTabId = targetTab === 'My Voices' ? 'MyVoices' : targetTab;
+                    const tabXPath = `//div[@role="tab" and @id[contains(., "${legacyTabId}")]]`;
+                    tabButton = this.getElementByXPath(tabXPath);
+                }
+
+                if (tabButton && !tabButton.classList.contains('ant-tabs-tab-active') && tabButton.getAttribute('aria-selected') !== 'true') {
+                    this.log(`Switching to ${targetTab} tab...`);
+                    tabButton.click();
+                    await this.sleep(1000);
+                }
+
+                const input = await this.waitForElement(this.selectors.searchVoiceInput, 5000);
+                if (!input) continue;
+
+                this.setNativeInputValue(input, '');
+                await this.sleep(200);
+                this.setNativeInputValue(input, targetId);
+                await this.sleep(1800);
+
+                const cards = this.findVoiceResultCards();
+                const normalizedTarget = this.normalizeVoiceLabel(targetId);
+                let targetCard = cards.find((card) => {
+                    const text = this.normalizeVoiceLabel(card.innerText || card.textContent || '');
+                    return text.includes(normalizedTarget) || this.voiceLabelsMatch(text, targetId);
+                });
+                if (!targetCard) {
+                    targetCard = cards.find((card) => !!this.getVoiceActionState(card));
+                }
+                if (!targetCard && cards.length === 1) targetCard = cards[0];
+                if (!targetCard && cards.length > 0) targetCard = cards[0];
+                if (!targetCard) continue;
+
+                targetCard.click();
+                await this.sleep(200);
+
+                let actionState = this.getVoiceActionState(targetCard);
+                if (!actionState) {
+                    actionState = this.getVoiceActionState(document.querySelector('.ant-modal-root .ant-modal-content, .ant-modal-content, .ant-modal') || document);
+                }
+                if (!actionState) continue;
+                this.log(`[VoiceSwitch] action=${actionState.state} via ${targetTab}`);
+
+                if (actionState.state === 'selected') {
+                    this.log('Voice already selected in search result.');
+                    this.currentVoiceId = targetId;
+                    applied = true;
+                    break;
+                }
+
+                if (actionState.state === 'use') {
+                    this.log('[VoiceSwitch] clicking Use');
+                    actionState.element.click();
+                    await this.sleep(1000);
+                    this.currentVoiceId = targetId;
+                    applied = true;
+                    break;
+                }
             }
 
-            const input = await this.waitForElement(this.selectors.searchVoiceInput, 5000);
-            if (!input) throw new Error('Voice Search input not found');
-
-            // Очищаем инпут перед вводом (на всякий случай)
-            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-            setter.call(input, '');
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-            await this.sleep(200);
-
-            setter.call(input, targetId);
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-            await this.sleep(2000); // Ждем результаты поиска
-
-            this.log('Searching result action (Use/Selected)...');
-            
-            // Проверяем "No voice yet"
-            const noVoiceMessage = document.querySelector('#voice-selection-scroll-list p.text-bg_opacity_30');
-            if (noVoiceMessage && /there is no voice yet/i.test(noVoiceMessage.textContent || '')) {
-                this.log('Voice not found (There is no voice yet).');
-                throw new Error(`Voice ID "${targetId}" not found`);
-            }
-
-            const cards = this.findVoiceResultCards();
-            const normalizedTarget = this.normalizeVoiceLabel(targetId);
-            let targetCard = cards.find((card) => {
-                const text = this.normalizeVoiceLabel(card.innerText || card.textContent || '');
-                return text.includes(normalizedTarget) || this.voiceLabelsMatch(text, targetId);
-            });
-            if (!targetCard) {
-                targetCard = cards.find((card) => !!this.getVoiceActionState(card));
-            }
-            if (!targetCard && cards.length === 1) targetCard = cards[0];
-            if (!targetCard && cards.length > 0) targetCard = cards[0];
-            if (!targetCard) throw new Error(`Voice ID "${targetId}" not found`);
-
-            targetCard.click();
-            await this.sleep(200);
-
-            let actionState = this.getVoiceActionState(targetCard);
-            if (!actionState) {
-                actionState = this.getVoiceActionState(document.querySelector('.ant-modal-root .ant-modal-content, .ant-modal-content, .ant-modal') || document);
-            }
-            if (!actionState) throw new Error(`Voice ID "${targetId}" not found (Use/Selected missing)`);
-            this.log(`[VoiceSwitch] action=${actionState.state}`);
-
-            if (actionState.state === 'selected') {
-                this.log('Voice already selected in search result.');
-                this.currentVoiceId = targetId;
-                return;
-            }
-
-            if (actionState.state === 'use') {
-                this.log('[VoiceSwitch] clicking Use');
-                actionState.element.click();
-                await this.sleep(1000);
-                this.currentVoiceId = targetId;
-                return;
-            }
-
-            throw new Error(`Voice ID "${targetId}" not found (unknown action state)`);
+            if (!applied) throw new Error(`Voice ID "${targetId}" not found`);
         } finally {
             if (modalOpened) {
                 this.closeVoiceModal();
@@ -781,43 +1009,58 @@ class VoiceoverAutomation {
     }
 
     async ensureLanguage(targetLang) {
+        const getCurrentLanguageText = () => {
+            const currentValEl = document.querySelector(this.selectors.languageCurrentValue);
+            return currentValEl ? currentValEl.innerText.trim() : '';
+        };
+
         const trigger = document.querySelector(this.selectors.languageDropdownTrigger);
         if (!trigger) throw new Error('Language selector not found');
 
-        const currentValEl = document.querySelector(this.selectors.languageCurrentValue);
-        const currentText = currentValEl ? currentValEl.innerText.trim() : '';
+        const currentText = getCurrentLanguageText();
 
         if (currentText === targetLang) return;
 
-        trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-        trigger.click();
-        await this.sleep(1000); 
+        const chooseLanguageOption = async () => {
+            trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+            trigger.click();
+            await this.sleep(1000);
 
-        const optionXPath = this.selectors.languageOptionXPath(targetLang);
-        let option = this.getElementByXPath(optionXPath);
+            const optionXPath = this.selectors.languageOptionXPath(targetLang);
+            let option = this.getElementByXPath(optionXPath);
 
-        if (!option) {
-            const dropdowns = document.querySelectorAll('.ant-select-dropdown:not(.ant-select-dropdown-hidden) .rc-virtual-list-holder');
-            const listHolder = dropdowns[dropdowns.length - 1];
-            if (listHolder) {
-                for (let i = 0; i < 10; i++) {
-                    listHolder.scrollTop += 200;
-                    await this.sleep(200);
-                    option = this.getElementByXPath(optionXPath);
-                    if (option) break;
+            if (!option) {
+                const dropdowns = document.querySelectorAll('.ant-select-dropdown:not(.ant-select-dropdown-hidden) .rc-virtual-list-holder');
+                const listHolder = dropdowns[dropdowns.length - 1];
+                if (listHolder) {
+                    for (let i = 0; i < 10; i++) {
+                        listHolder.scrollTop += 200;
+                        await this.sleep(200);
+                        option = this.getElementByXPath(optionXPath);
+                        if (option) break;
+                    }
                 }
             }
-        }
 
-        if (option) {
+            if (!option) {
+                trigger.click();
+                return false;
+            }
+
             option.scrollIntoView({ block: 'center' });
             await this.sleep(200);
             option.click();
-            await this.sleep(1000); 
-        } else {
-            trigger.click();
-            throw new Error(`Language "${targetLang}" not found`);
+            await this.sleep(800);
+            return getCurrentLanguageText() === targetLang;
+        };
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const applied = await chooseLanguageOption();
+            if (applied) return;
+            await this.sleep(400);
         }
+
+        throw new Error(`Language "${targetLang}" was not applied`);
     }
 
     getElementByXPath(xpath) {
@@ -900,6 +1143,20 @@ class VoiceoverAutomation {
                 }
             }, 1000);
         });
+    }
+
+    async getCapturedAudioData(timeout = 10000) {
+        const result = await this.callBridge('consumeCapturedAudio', timeout);
+        if (!result || !result.ok) {
+            throw new Error(result && result.reason ? result.reason : 'Audio capture failed');
+        }
+        if (result.src) {
+            this.log(`Audio source candidate found: ${String(result.src).slice(0, 120)}`);
+        }
+        if (typeof result.dataUrl === 'string' && result.dataUrl.startsWith('data:audio/')) {
+            return result;
+        }
+        throw new Error('Audio blob conversion failed');
     }
 
     async findGenerateButton() {

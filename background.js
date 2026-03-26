@@ -39,13 +39,17 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
 
     const isBlobUrl = typeof item.url === 'string' && item.url.startsWith('blob:');
     const isBlobMp3 = isBlobUrl && typeof item.filename === 'string' && item.filename.toLowerCase().endsWith('.mp3');
-    if (!item.url || (!isValidAudioUrl(item.url) && !isBlobMp3)) {
+    const isDataAudio = typeof item.url === 'string' && item.url.startsWith('data:audio/');
+    if (!item.url || (!isValidAudioUrl(item.url) && !isBlobMp3 && !isDataAudio)) {
       console.log('[Background] Prime active but download is not a valid audio url, skipping rename');
       return;
     }
-    const { folderName, fileNamePrefix, fileNumber } = nextDownloadConfig;
-    const paddedNumber = String(fileNumber).padStart(4, '0');
-    const newFilename = `${folderName}/${paddedNumber}_${fileNamePrefix}.mp3`;
+        const { folderName, fileNamePrefix, fileNumber, downloadLayout } = nextDownloadConfig;
+        const isPackageLayout = downloadLayout === 'package';
+        const paddedNumber = String(fileNumber).padStart(isPackageLayout ? 3 : 4, '0');
+        const newFilename = isPackageLayout
+          ? `${folderName}/${paddedNumber}__${fileNamePrefix}.mp3`
+          : `${folderName}/${paddedNumber}_${fileNamePrefix}.mp3`;
     
     console.log(`[Background] Реноме по "брони": ${newFilename}`);
     
@@ -83,6 +87,80 @@ function sanitizeFilename(filename) {
     .replace(/\.+$/, '')
     .replace(/\s+/g, '_')  // Заменяем пробелы на подчеркивания
     .slice(0, 100);
+}
+
+async function buildDownloadTarget({ voiceName, scriptName, forceIndex, speakerName, downloadLayout }) {
+  const sanitizedVoice = sanitizeFilename(voiceName || 'dictor');
+  const sanitizedScript = scriptName ? sanitizeFilename(scriptName) : null;
+  const sanitizedSpeaker = speakerName ? sanitizeFilename(speakerName) : sanitizedVoice;
+  const normalizedLayout = String(downloadLayout || '').trim().toLowerCase();
+
+  let folderName;
+  let fileNamePrefix;
+  let padLength = 4;
+
+  if (normalizedLayout === 'package') {
+    folderName = sanitizedScript || sanitizedSpeaker || sanitizedVoice;
+    fileNamePrefix = sanitizedSpeaker || sanitizedVoice || sanitizedScript || 'dictor';
+    padLength = 3;
+  } else {
+    folderName = sanitizedScript ? `${sanitizedScript} - ${sanitizedSpeaker}` : sanitizedSpeaker;
+    fileNamePrefix = sanitizedScript ? `${sanitizedScript} - ${sanitizedSpeaker}` : sanitizedSpeaker;
+  }
+
+  let fileNumber = forceIndex;
+  if (!fileNumber) {
+    fileNumber = await getNextFileNumber(folderName);
+  }
+
+  await ensureFileCounterAtLeast(folderName, fileNumber);
+
+  return {
+    folderName,
+    fileNamePrefix,
+    fileNumber,
+    downloadLayout: normalizedLayout || 'default',
+    newFilename: normalizedLayout === 'package'
+      ? `${folderName}/${String(fileNumber).padStart(padLength, '0')}__${fileNamePrefix}.mp3`
+      : `${folderName}/${String(fileNumber).padStart(padLength, '0')}_${fileNamePrefix}.mp3`
+  };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForDownloadConfirmation(downloadId, timeoutMs = 15000) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const items = await chrome.downloads.search({ id: downloadId });
+    const item = Array.isArray(items) ? items[0] : null;
+
+    if (item) {
+      if (item.error || item.state === 'interrupted') {
+        return {
+          ok: false,
+          reason: item.error || 'download_interrupted'
+        };
+      }
+
+      if (item.state === 'in_progress' || item.state === 'complete') {
+        return {
+          ok: true,
+          state: item.state,
+          filename: item.filename || null
+        };
+      }
+    }
+
+    await sleep(250);
+  }
+
+  return {
+    ok: false,
+    reason: 'download_confirmation_timeout'
+  };
 }
 
 let fileCountersLock = Promise.resolve();
@@ -326,34 +404,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             voiceName = tabVoices[tabId] || 'dictor';
         }
 
-        voiceName = sanitizeFilename(voiceName);
+        const target = await buildDownloadTarget({
+          voiceName,
+          scriptName: request.scriptName || null,
+          forceIndex: request.forceIndex || null,
+          speakerName: request.forceSpeaker || null,
+          downloadLayout: request.downloadLayout || null
+        });
 
-        // ИСПРАВЛЕНО: Формат "ScriptName - SpeakerName"
-        let folderName = voiceName;
-        let fileNamePrefix = voiceName;
-        if (request.scriptName) {
-            const sanitizedScriptName = sanitizeFilename(request.scriptName);
-            folderName = `${sanitizedScriptName} - ${voiceName}`;
-            fileNamePrefix = `${sanitizedScriptName} - ${voiceName}`;
-        }
-
-        let fileNumber;
-        if (request.forceIndex) {
-          fileNumber = request.forceIndex;
-          console.log(`[Background] Принудительный номер: ${fileNumber} для ${folderName}`);
-          await ensureFileCounterAtLeast(folderName, fileNumber);
-        } else {
-          fileNumber = await getNextFileNumber(folderName);
-        }
-
-        const paddedNumber = String(fileNumber).padStart(4, '0');
-        const newFilename = `${folderName}/${paddedNumber}_${fileNamePrefix}.mp3`;
-
-        console.log(`Скачиваем как ${newFilename}`);
+        console.log(`Скачиваем как ${target.newFilename}`);
 
         chrome.downloads.download({
           url: url,
-          filename: newFilename,
+          filename: target.newFilename,
           conflictAction: 'uniquify',
           saveAs: false
         }, async (downloadId) => {
@@ -361,8 +424,76 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             console.error('Ошибка скачивания:', chrome.runtime.lastError);
             sendResponse({ success: false, reason: chrome.runtime.lastError.message });
           } else {
-            saveToDownloadHistory(folderName, newFilename, fileNumber);
-            sendResponse({ success: true, downloadId });
+            const confirmResult = await waitForDownloadConfirmation(downloadId);
+            if (!confirmResult.ok) {
+              sendResponse({ success: false, reason: confirmResult.reason, downloadId });
+              return;
+            }
+
+            saveToDownloadHistory(target.folderName, target.newFilename, target.fileNumber);
+            sendResponse({
+              success: true,
+              downloadId,
+              fileNumber: target.fileNumber,
+              state: confirmResult.state,
+              filename: confirmResult.filename
+            });
+          }
+        });
+
+      } else if (request.action === "downloadAudioData") {
+        if (!extensionEnabled) {
+          sendResponse({ success: false, reason: 'disabled' });
+          return;
+        }
+
+        if (typeof request.dataUrl !== 'string' || !request.dataUrl.startsWith('data:audio/')) {
+          sendResponse({ success: false, reason: 'invalid-data-url' });
+          return;
+        }
+
+        const target = await buildDownloadTarget({
+          voiceName: request.voiceName,
+          scriptName: request.scriptName || null,
+          forceIndex: request.forceIndex || null,
+          speakerName: request.speakerName || null,
+          downloadLayout: request.downloadLayout || null
+        });
+
+        nextDownloadConfig = {
+          folderName: target.folderName,
+          fileNamePrefix: target.fileNamePrefix,
+          fileNumber: target.fileNumber,
+          downloadLayout: target.downloadLayout,
+          tabId: sender.tab?.id ?? null,
+          createdAt: Date.now()
+        };
+
+        console.log(`Скачиваем audio data как ${target.newFilename}`);
+
+        chrome.downloads.download({
+          url: request.dataUrl,
+          saveAs: false
+        }, async (downloadId) => {
+          if (chrome.runtime.lastError) {
+            console.error('Ошибка скачивания data url:', chrome.runtime.lastError);
+            nextDownloadConfig = null;
+            sendResponse({ success: false, reason: chrome.runtime.lastError.message });
+          } else {
+            const confirmResult = await waitForDownloadConfirmation(downloadId);
+            if (!confirmResult.ok) {
+              nextDownloadConfig = null;
+              sendResponse({ success: false, reason: confirmResult.reason, downloadId });
+              return;
+            }
+
+            sendResponse({
+              success: true,
+              downloadId,
+              fileNumber: target.fileNumber,
+              state: confirmResult.state,
+              filename: confirmResult.filename
+            });
           }
         });
 
@@ -431,35 +562,25 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         }
         // "Бронируем" имя файла для следующего скачивания (для DIV-кнопок без href)
         const { voiceName, scriptName, forceIndex, speakerName } = request;
-        const sanitizedVoice = sanitizeFilename(voiceName);
-        const sanitizedScript = scriptName ? sanitizeFilename(scriptName) : null;
-        const sanitizedSpeaker = speakerName ? sanitizeFilename(speakerName) : sanitizedVoice;
-        
-        // ЛОГИКА: 
-        // Папка = ScriptName - SpeakerName (группировка по файлу и спикеру)
-        // Имя файла = ScriptName - SpeakerName (без индекса в имени)
-        const folderName = sanitizedScript ? `${sanitizedScript} - ${sanitizedSpeaker}` : sanitizedSpeaker;
-        const fileNamePrefix = sanitizedScript ? `${sanitizedScript} - ${sanitizedSpeaker}` : sanitizedSpeaker;
-        
-        // Получаем номер для этого спикера в этой папке
-        let fileNumber = forceIndex;
-        
-        if (!fileNumber) {
-            fileNumber = await getNextFileNumber(folderName);
-        }
-
-        await ensureFileCounterAtLeast(folderName, fileNumber);
+        const target = await buildDownloadTarget({
+          voiceName,
+          scriptName,
+          forceIndex,
+          speakerName,
+          downloadLayout: request.downloadLayout || null
+        });
         
         nextDownloadConfig = {
-            folderName: folderName,
-            fileNamePrefix: fileNamePrefix,
-            fileNumber: fileNumber,
+            folderName: target.folderName,
+            fileNamePrefix: target.fileNamePrefix,
+            fileNumber: target.fileNumber,
+            downloadLayout: target.downloadLayout,
             tabId: sender.tab?.id ?? null,
             createdAt: Date.now()
         };
         
-        console.log(`[Background] Primed next download: ${folderName}/${fileNumber}`);
-        sendResponse({ success: true, fileNumber });
+        console.log(`[Background] Primed next download: ${target.folderName}/${target.fileNumber}`);
+        sendResponse({ success: true, fileNumber: target.fileNumber });
       } else if (request.action === "executeInMainWorld") {
         if (!extensionEnabled) {
           sendResponse({ success: false, reason: 'disabled' });
@@ -552,6 +673,283 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             });
             el.dispatchEvent(ev);
             return { ok: true };
+          },
+
+          ensureAudioCaptureInstalled: function() {
+            function buildSession() {
+              return {
+                resetAt: Date.now(),
+                blob: null,
+                blobType: '',
+                blobUrl: '',
+                mediaSource: null,
+                mediaSourceUrl: '',
+                sourceBufferTypes: [],
+                chunks: [],
+                totalBytes: 0,
+                lastChunkAt: 0,
+                endedAt: 0
+              };
+            }
+
+            if (window.__minimaxAudioCapture && window.__minimaxAudioCapture.installed) {
+              return { ok: true, alreadyInstalled: true };
+            }
+
+            if (typeof MediaSource === 'undefined' || !MediaSource.prototype) {
+              return { ok: false, reason: 'mediasource_unavailable' };
+            }
+
+            var originalCreateObjectURL = URL.createObjectURL.bind(URL);
+            var originalAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
+            var originalEndOfStream = MediaSource.prototype.endOfStream;
+            var mediaSourceSessions = new WeakMap();
+            var sourceBufferSessions = new WeakMap();
+
+            function shouldCaptureBlob(blob) {
+              if (!(blob instanceof Blob)) return false;
+              var type = String(blob.type || '').toLowerCase();
+              return type.indexOf('audio/') === 0 || type.indexOf('mpeg') >= 0 || type.indexOf('mp3') >= 0;
+            }
+
+            function normalizeChunk(data) {
+              if (!data) return null;
+              var view = data instanceof Uint8Array ? data : new Uint8Array(data);
+              return view.slice ? view.slice(0) : new Uint8Array(view);
+            }
+
+            function registerMediaSourceSession(mediaSource, session, url) {
+              session.mediaSource = mediaSource;
+              session.mediaSourceUrl = url;
+              mediaSourceSessions.set(mediaSource, session);
+            }
+
+            function blobToDataUrl(blob) {
+              return new Promise(function(resolve, reject) {
+                var reader = new FileReader();
+                reader.onloadend = function() { resolve(reader.result); };
+                reader.onerror = function() { reject(reader.error || new Error('blob read failed')); };
+                reader.readAsDataURL(blob);
+              });
+            }
+
+            var capture = {
+              installed: true,
+              activeSession: buildSession(),
+              resetSession: function() {
+                this.activeSession = buildSession();
+                return { ok: true, resetAt: this.activeSession.resetAt };
+              },
+              consumeCapturedAudio: async function(timeout) {
+                var maxWait = Number(timeout) || 10000;
+                var startedAt = Date.now();
+                var session = this.activeSession;
+
+                while (Date.now() - startedAt < maxWait) {
+                  if (session.blob && session.blob.size > 0) {
+                    return {
+                      ok: true,
+                      source: 'blob',
+                      src: session.blobUrl || '',
+                      size: session.blob.size,
+                      dataUrl: await blobToDataUrl(session.blob)
+                    };
+                  }
+
+                  if (session.chunks.length > 0) {
+                    var isQuiet = session.lastChunkAt && (Date.now() - session.lastChunkAt > 800);
+                    if (session.endedAt || isQuiet) {
+                      var audioType = session.sourceBufferTypes.find(function(type) {
+                        return String(type || '').toLowerCase().indexOf('audio/') === 0;
+                      }) || 'audio/mpeg';
+                      var chunkBlob = new Blob(session.chunks, { type: audioType });
+                      if (chunkBlob.size > 0) {
+                        return {
+                          ok: true,
+                          source: 'mediasource',
+                          src: session.mediaSourceUrl || '',
+                          size: chunkBlob.size,
+                          chunkCount: session.chunks.length,
+                          dataUrl: await blobToDataUrl(chunkBlob)
+                        };
+                      }
+                    }
+                  }
+
+                  await new Promise(function(resolve) { setTimeout(resolve, 250); });
+                }
+
+                return {
+                  ok: false,
+                  reason: 'audio_not_captured',
+                  src: session.blobUrl || session.mediaSourceUrl || '',
+                  chunkCount: session.chunks.length,
+                  totalBytes: session.totalBytes,
+                  sourceBufferTypes: session.sourceBufferTypes
+                };
+              }
+            };
+
+            URL.createObjectURL = function(object) {
+              var url = originalCreateObjectURL(object);
+              var session = capture.activeSession;
+
+              try {
+                if (shouldCaptureBlob(object)) {
+                  session.blob = object;
+                  session.blobType = object.type || 'audio/mpeg';
+                  session.blobUrl = url;
+                } else if (object instanceof MediaSource) {
+                  registerMediaSourceSession(object, session, url);
+                }
+              } catch (error) {
+                console.warn('[MiniMax Capture] createObjectURL hook failed:', error);
+              }
+
+              return url;
+            };
+
+            MediaSource.prototype.addSourceBuffer = function(mimeType) {
+              var sourceBuffer = originalAddSourceBuffer.apply(this, arguments);
+
+              try {
+                var session = mediaSourceSessions.get(this);
+                if (session) {
+                  session.sourceBufferTypes.push(String(mimeType || ''));
+
+                  if (!sourceBufferSessions.has(sourceBuffer)) {
+                    sourceBufferSessions.set(sourceBuffer, session);
+                    var originalAppendBuffer = sourceBuffer.appendBuffer;
+                    sourceBuffer.appendBuffer = function(data) {
+                      var targetSession = sourceBufferSessions.get(sourceBuffer);
+                      if (targetSession) {
+                        var chunk = normalizeChunk(data);
+                        if (chunk && chunk.byteLength > 0) {
+                          targetSession.chunks.push(chunk);
+                          targetSession.totalBytes += chunk.byteLength;
+                          targetSession.lastChunkAt = Date.now();
+                        }
+                      }
+                      return originalAppendBuffer.apply(this, arguments);
+                    };
+                  }
+                }
+              } catch (error) {
+                console.warn('[MiniMax Capture] addSourceBuffer hook failed:', error);
+              }
+
+              return sourceBuffer;
+            };
+
+            MediaSource.prototype.endOfStream = function() {
+              try {
+                var session = mediaSourceSessions.get(this);
+                if (session) {
+                  session.endedAt = Date.now();
+                }
+              } catch (error) {
+                console.warn('[MiniMax Capture] endOfStream hook failed:', error);
+              }
+
+              return originalEndOfStream.apply(this, arguments);
+            };
+
+            window.__minimaxAudioCapture = capture;
+            return { ok: true, alreadyInstalled: false };
+          },
+
+          resetAudioCaptureSession: function() {
+            var capture = window.__minimaxAudioCapture;
+            if (!capture || !capture.installed || typeof capture.resetSession !== 'function') {
+              return { ok: false, reason: 'capture_not_installed' };
+            }
+            return capture.resetSession();
+          },
+
+          consumeCapturedAudio: async function(timeout) {
+            var capture = window.__minimaxAudioCapture;
+            if (!capture || !capture.installed || typeof capture.consumeCapturedAudio !== 'function') {
+              return { ok: false, reason: 'capture_not_installed' };
+            }
+            return await capture.consumeCapturedAudio(timeout);
+          },
+
+          getLatestAudioDataUrl: async function(timeout) {
+            var capture = window.__minimaxAudioCapture;
+            if (!capture || !capture.installed || typeof capture.consumeCapturedAudio !== 'function') {
+              return { ok: false, reason: 'capture_not_installed' };
+            }
+            return await capture.consumeCapturedAudio(timeout);
+          },
+
+          triggerMp3Download: function() {
+            function isVisibleElement(el) {
+              if (!el) return false;
+              var style = window.getComputedStyle(el);
+              if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+              var rect = el.getBoundingClientRect();
+              return rect.width > 0 && rect.height > 0;
+            }
+
+            function findMp3Item() {
+              var dropdowns = Array.from(document.querySelectorAll('.ant-dropdown, [role="menu"]'))
+                .filter(function(el) { return isVisibleElement(el) && !el.classList.contains('ant-dropdown-hidden'); });
+
+              for (var i = 0; i < dropdowns.length; i++) {
+                var items = Array.from(dropdowns[i].querySelectorAll('li[role="menuitem"], .ant-dropdown-menu-item, [role="menuitem"]'));
+                var byId = items.find(function(item) {
+                  var dataMenuId = String(item.getAttribute('data-menu-id') || '').toLowerCase();
+                  return dataMenuId.includes('tts_no_watermark') && !dataMenuId.includes('wav');
+                });
+                if (byId) return byId;
+
+                var byText = items.find(function(item) {
+                  var text = String(item.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                  return text.includes('mp3');
+                });
+                if (byText) return byText;
+              }
+
+              return null;
+            }
+
+            function invokeReactClick(el) {
+              var current = el;
+              while (current) {
+                var propsKey = Object.keys(current).find(function(k) { return k.startsWith('__reactProps$'); });
+                if (propsKey && current[propsKey]) {
+                  var props = current[propsKey];
+                  if (typeof props.onClick === 'function') {
+                    props.onClick({
+                      type: 'click',
+                      target: el,
+                      currentTarget: current,
+                      nativeEvent: new MouseEvent('click', { bubbles: true, cancelable: true, view: window }),
+                      preventDefault: function() {},
+                      stopPropagation: function() {}
+                    });
+                    return { ok: true, mode: 'react-onClick' };
+                  }
+                }
+                current = current.parentElement;
+              }
+              return { ok: false, mode: 'react-onClick-missing' };
+            }
+
+            var item = findMp3Item();
+            if (!item) {
+              return { ok: false, reason: 'mp3_item_not_found' };
+            }
+
+            var invoked = invokeReactClick(item);
+            if (invoked.ok) {
+              return invoked;
+            }
+
+            item.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+            item.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+            item.click();
+            return { ok: true, mode: 'native-click-fallback' };
           }
         };
 

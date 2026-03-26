@@ -614,17 +614,32 @@
 
     .voice-mapping-item {
       display: flex;
-      align-items: center;
+      align-items: flex-start;
+      flex-direction: column;
       background: #11151a;
       border: 1px solid var(--md-sys-color-outline);
       border-radius: 12px;
       padding: 8px 12px;
-      gap: 10px;
+      gap: 8px;
     }
 
-    .voice-mapping-info { flex: 1; min-width: 0; }
+    .voice-mapping-info {
+      width: 100%;
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
     .voice-mapping-label { font-size: 12px; font-weight: 600; display: block; }
     .voice-mapping-count { font-size: 11px; color: var(--md-sys-color-on-surface-variant); }
+
+    .voice-mapping-controls {
+      width: 100%;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
 
     .voice-mapping-input {
       flex: 1;
@@ -638,6 +653,32 @@
     }
 
     .voice-mapping-input:focus { border-color: rgba(37, 99, 235, 0.6); outline: none; }
+
+    .voice-mapping-clear {
+      flex: 0 0 auto;
+      min-width: 72px;
+      padding: 6px 10px;
+    }
+
+    .voice-source-controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .voice-source-controls .input {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .voice-source-status {
+      min-height: 18px;
+      font-size: 11px;
+      color: var(--md-sys-color-on-surface-variant);
+    }
+
+    .voice-source-status.success { color: var(--md-sys-color-primary); }
+    .voice-source-status.error { color: var(--md-sys-color-error); }
 
     /* Уменьшаем отступы между карточками в мульти-режиме */
     #multiConfigContainer {
@@ -1003,8 +1044,12 @@
         <div id="multiConfigContainer" style="display: none;">
           <section class="card">
             <div class="form-group">
-              <label>язык озвучки</label>
-              <select id="multiLanguageSelect"></select>
+              <label>голоса с сайта</label>
+              <div class="voice-source-controls">
+                <input type="text" class="input" id="multiVoicePrefixInput" placeholder="префикс для поиска в My Voices" value="mp">
+                <button id="refreshSiteVoicesButton" class="btn btn-outline">Обновить</button>
+              </div>
+              <div id="siteVoicesStatus" class="voice-source-status"></div>
             </div>
           </section>
 
