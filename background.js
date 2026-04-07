@@ -89,10 +89,12 @@ function sanitizeFilename(filename) {
     .slice(0, 100);
 }
 
-async function buildDownloadTarget({ voiceName, scriptName, forceIndex, speakerName, downloadLayout }) {
+async function buildDownloadTarget({ voiceName, scriptName, forceIndex, speakerName, downloadLayout, sourceFileName, sourceFileBaseName }) {
   const sanitizedVoice = sanitizeFilename(voiceName || 'dictor');
   const sanitizedScript = scriptName ? sanitizeFilename(scriptName) : null;
   const sanitizedSpeaker = speakerName ? sanitizeFilename(speakerName) : sanitizedVoice;
+  const rawSourceBase = sourceFileBaseName || (sourceFileName ? String(sourceFileName).replace(/\.[^.]+$/, '') : '');
+  const sanitizedSourceBase = rawSourceBase ? sanitizeFilename(rawSourceBase) : null;
   const normalizedLayout = String(downloadLayout || '').trim().toLowerCase();
 
   let folderName;
@@ -101,7 +103,8 @@ async function buildDownloadTarget({ voiceName, scriptName, forceIndex, speakerN
 
   if (normalizedLayout === 'package') {
     folderName = sanitizedScript || sanitizedSpeaker || sanitizedVoice;
-    fileNamePrefix = sanitizedSpeaker || sanitizedVoice || sanitizedScript || 'dictor';
+    fileNamePrefix = [sanitizedSourceBase, sanitizedSpeaker || sanitizedVoice].filter(Boolean).join('__')
+      || sanitizedSpeaker || sanitizedVoice || sanitizedScript || 'dictor';
     padLength = 3;
   } else {
     folderName = sanitizedScript ? `${sanitizedScript} - ${sanitizedSpeaker}` : sanitizedSpeaker;
@@ -409,7 +412,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           scriptName: request.scriptName || null,
           forceIndex: request.forceIndex || null,
           speakerName: request.forceSpeaker || null,
-          downloadLayout: request.downloadLayout || null
+          downloadLayout: request.downloadLayout || null,
+          sourceFileName: request.sourceFileName || null,
+          sourceFileBaseName: request.sourceFileBaseName || null
         });
 
         console.log(`Скачиваем как ${target.newFilename}`);
@@ -457,7 +462,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           scriptName: request.scriptName || null,
           forceIndex: request.forceIndex || null,
           speakerName: request.speakerName || null,
-          downloadLayout: request.downloadLayout || null
+          downloadLayout: request.downloadLayout || null,
+          sourceFileName: request.sourceFileName || null,
+          sourceFileBaseName: request.sourceFileBaseName || null
         });
 
         nextDownloadConfig = {
@@ -679,6 +686,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             function buildSession() {
               return {
                 resetAt: Date.now(),
+                state: 'started',
                 blob: null,
                 blobType: '',
                 blobUrl: '',
@@ -687,8 +695,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 sourceBufferTypes: [],
                 chunks: [],
                 totalBytes: 0,
+                firstChunkAt: 0,
                 lastChunkAt: 0,
-                endedAt: 0
+                endedAt: 0,
+                finalSignalAt: 0,
+                finalSignalKind: ''
               };
             }
 
@@ -703,6 +714,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             var originalCreateObjectURL = URL.createObjectURL.bind(URL);
             var originalAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
             var originalEndOfStream = MediaSource.prototype.endOfStream;
+            var originalWebSocketDispatchEvent = typeof WebSocket !== 'undefined' && WebSocket.prototype
+              ? WebSocket.prototype.dispatchEvent
+              : null;
             var mediaSourceSessions = new WeakMap();
             var sourceBufferSessions = new WeakMap();
 
@@ -721,7 +735,31 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             function registerMediaSourceSession(mediaSource, session, url) {
               session.mediaSource = mediaSource;
               session.mediaSourceUrl = url;
+              session.state = 'receiving_chunks';
               mediaSourceSessions.set(mediaSource, session);
+            }
+
+            function markFinalSignal(kind) {
+              var session = capture && capture.activeSession;
+              if (!session) return;
+              session.finalSignalAt = Date.now();
+              session.finalSignalKind = kind || 'unknown';
+              if (session.state !== 'stream_closed') {
+                session.state = 'terminal_signal_seen';
+              }
+            }
+
+            function inspectWebSocketPayload(payload) {
+              if (!payload || typeof payload !== 'object') return;
+              if (payload.extra_info) {
+                markFinalSignal('extra_info');
+                return;
+              }
+              if (payload.base_resp && (payload.base_resp.status_code === 0 || payload.base_resp.code === 0) && payload.data && !payload.input_sensitive) {
+                if (payload.data.finish_reason || payload.data.is_final || payload.data.completed) {
+                  markFinalSignal('data_final');
+                }
+              }
             }
 
             function blobToDataUrl(blob) {
@@ -730,6 +768,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 reader.onloadend = function() { resolve(reader.result); };
                 reader.onerror = function() { reject(reader.error || new Error('blob read failed')); };
                 reader.readAsDataURL(blob);
+              });
+            }
+
+            function isGenerationUiBusy() {
+              var buttons = Array.from(document.querySelectorAll('button'));
+              return buttons.some(function(btn) {
+                var text = String(btn.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                if (!text) return false;
+                var isGenerateButton = text.indexOf('generate') >= 0 || text.indexOf('regenerate') >= 0 || text.indexOf('generating') >= 0;
+                if (!isGenerateButton) return false;
+                return text.indexOf('generating') >= 0 || !!btn.disabled || btn.classList.contains('opacity-60');
               });
             }
 
@@ -747,29 +796,43 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
                 while (Date.now() - startedAt < maxWait) {
                   if (session.blob && session.blob.size > 0) {
+                    session.state = 'ready_to_consume';
                     return {
                       ok: true,
                       source: 'blob',
+                      completionReason: 'blob_ready',
                       src: session.blobUrl || '',
                       size: session.blob.size,
+                      terminalSignalSeen: !!session.finalSignalAt,
+                      streamClosed: !!session.endedAt,
                       dataUrl: await blobToDataUrl(session.blob)
                     };
                   }
 
                   if (session.chunks.length > 0) {
-                    var isQuiet = session.lastChunkAt && (Date.now() - session.lastChunkAt > 800);
-                    if (session.endedAt || isQuiet) {
+                    var quietForMs = session.lastChunkAt ? (Date.now() - session.lastChunkAt) : 0;
+                    var hasFinalSignal = !!session.finalSignalAt;
+                    var streamClosed = !!session.endedAt;
+                    var websocketFinished = hasFinalSignal && quietForMs > 1500;
+                    if (streamClosed || websocketFinished) {
                       var audioType = session.sourceBufferTypes.find(function(type) {
                         return String(type || '').toLowerCase().indexOf('audio/') === 0;
                       }) || 'audio/mpeg';
                       var chunkBlob = new Blob(session.chunks, { type: audioType });
                       if (chunkBlob.size > 0) {
+                        session.state = 'ready_to_consume';
                         return {
                           ok: true,
                           source: 'mediasource',
+                          completionReason: streamClosed
+                            ? 'endofstream'
+                            : ('ws_' + (session.finalSignalKind || 'final')),
                           src: session.mediaSourceUrl || '',
                           size: chunkBlob.size,
                           chunkCount: session.chunks.length,
+                          quietForMs: quietForMs,
+                          terminalSignalSeen: hasFinalSignal,
+                          streamClosed: streamClosed,
                           dataUrl: await blobToDataUrl(chunkBlob)
                         };
                       }
@@ -781,10 +844,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
                 return {
                   ok: false,
-                  reason: 'audio_not_captured',
+                  reason: session.totalBytes > 0
+                    ? (session.finalSignalAt || session.endedAt ? 'generation_stalled_after_audio' : 'final_signal_missing')
+                    : 'generation_never_started',
+                  state: session.state,
                   src: session.blobUrl || session.mediaSourceUrl || '',
                   chunkCount: session.chunks.length,
                   totalBytes: session.totalBytes,
+                  terminalSignalSeen: !!session.finalSignalAt,
+                  streamClosed: !!session.endedAt,
                   sourceBufferTypes: session.sourceBufferTypes
                 };
               }
@@ -825,6 +893,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                       if (targetSession) {
                         var chunk = normalizeChunk(data);
                         if (chunk && chunk.byteLength > 0) {
+                          if (!targetSession.firstChunkAt) {
+                            targetSession.firstChunkAt = Date.now();
+                          }
+                          targetSession.state = 'receiving_chunks';
                           targetSession.chunks.push(chunk);
                           targetSession.totalBytes += chunk.byteLength;
                           targetSession.lastChunkAt = Date.now();
@@ -846,6 +918,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 var session = mediaSourceSessions.get(this);
                 if (session) {
                   session.endedAt = Date.now();
+                  session.state = 'stream_closed';
                 }
               } catch (error) {
                 console.warn('[MiniMax Capture] endOfStream hook failed:', error);
@@ -853,6 +926,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
               return originalEndOfStream.apply(this, arguments);
             };
+
+            if (originalWebSocketDispatchEvent) {
+              WebSocket.prototype.dispatchEvent = function(event) {
+                try {
+                  if (event && event.type === 'message' && typeof event.data === 'string') {
+                    var trimmed = event.data.trim();
+                    if (trimmed && (trimmed[0] === '{' || trimmed[0] === '[')) {
+                      inspectWebSocketPayload(JSON.parse(trimmed));
+                    }
+                  }
+                } catch (error) {
+                  console.warn('[MiniMax Capture] websocket hook failed:', error);
+                }
+                return originalWebSocketDispatchEvent.apply(this, arguments);
+              };
+            }
 
             window.__minimaxAudioCapture = capture;
             return { ok: true, alreadyInstalled: false };

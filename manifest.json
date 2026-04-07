@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MiniMax TTS Automation",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "Автоматическая озвучка скриптов и умная организация загрузок TTS файлов с MiniMax.io",
   "icons": {
 	"16":"icons/16.png",

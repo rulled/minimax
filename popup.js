@@ -1637,12 +1637,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       for (let i = 0; i < batchFiles_Multi.length; i++) {
           const file = batchFiles_Multi[i];
           const scriptName = file.scriptName || getScriptNameForNaming(file.name);
+          const sourceFileBaseName = getScriptNameForNaming(file.name);
           const queue = prepareQueue(file.entries, file.excludedIds, {
               useVoiceMap: true,
               scriptName,
               downloadLayout: 'package',
+              groupByVoice: true,
               languageCode: file.languageCode || '',
-              defaultLanguage: file.language || getDefaultMultiLanguage()
+              defaultLanguage: file.language || getDefaultMultiLanguage(),
+              sourceFileName: file.name,
+              sourceFileBaseName,
+              sourceFileIndex: i + 1
           });
           if (queue.length === 0) continue;
           
@@ -1658,7 +1663,6 @@ document.addEventListener('DOMContentLoaded', async () => {
           const missing = [...missingMap.values()];
           if (missing.length && !confirm(`Файл "${file.name}"\nНет голоса для: ${missing.join(', ')}. Продолжить?`)) return;
 
-          queue.sort((a, b) => (a.downloadIndex || 0) - (b.downloadIndex || 0));
           batchJobs.push({ queue, mode: 'multi', scriptName });
       }
 
@@ -1703,33 +1707,78 @@ document.addEventListener('DOMContentLoaded', async () => {
       const useVoiceMap = !!options.useVoiceMap;
       const scriptName = options.scriptName || null;
       const downloadLayout = options.downloadLayout || 'default';
+      const groupByVoice = !!options.groupByVoice;
+      const sourceFileName = options.sourceFileName || null;
+      const sourceFileBaseName = options.sourceFileBaseName || getScriptNameForNaming(sourceFileName || scriptName || '');
+      const sourceFileIndex = options.sourceFileIndex || null;
       const fallbackLanguageCode = String(options.languageCode || '').trim().toUpperCase();
       const defaultLanguage = options.defaultLanguage || getDefaultMultiLanguage();
       const languageContext = {
           languageCode: fallbackLanguageCode,
           language: defaultLanguage
       };
-      const speakerCounters = {};
-      let globalCounter = 0;
-      return items
-          .filter(entry => !exclusionSet.has(entry.id))
+      const originalSpeakerCounters = {};
+      let originalGlobalCounter = 0;
+      const annotatedEntries = items
           .map(entry => {
               const entryLanguageCode = getEntryLanguageCode(entry, languageContext) || fallbackLanguageCode;
               const entryLanguage = getEntryMinimaxLanguage(entry, languageContext) || defaultLanguage;
-              if(!speakerCounters[entry.speaker]) speakerCounters[entry.speaker] = 0;
-              speakerCounters[entry.speaker]++;
-              globalCounter++;
+              if(!originalSpeakerCounters[entry.speaker]) originalSpeakerCounters[entry.speaker] = 0;
+              originalSpeakerCounters[entry.speaker]++;
+              originalGlobalCounter++;
               return {
                   ...entry,
-                  speakerIndex: speakerCounters[entry.speaker],
-                  downloadIndex: downloadLayout === 'package' ? globalCounter : speakerCounters[entry.speaker],
                   voiceId: useVoiceMap ? (getVoiceMappingValue(entry.speaker, entryLanguageCode) || null) : null,
                   scriptName: scriptName,
                   downloadLayout,
                   languageCode: entryLanguageCode,
-                  language: entryLanguage
+                  language: entryLanguage,
+                  sourceFileName,
+                  sourceFileBaseName,
+                  sourceFileIndex,
+                  originalSpeakerIndex: originalSpeakerCounters[entry.speaker],
+                  originalDownloadIndex: originalGlobalCounter
               };
           });
+
+      const resolvedEntries = annotatedEntries
+          .filter(entry => !exclusionSet.has(entry.id));
+
+      const processingEntries = groupByVoice
+          ? (() => {
+              const groupedEntries = new Map();
+              resolvedEntries.forEach((entry) => {
+                  const voiceGroupId = entry.voiceId
+                      ? `voice:${entry.voiceId}`
+                      : `speaker:${String(entry.speaker || '').trim().toLowerCase()}`;
+                  const groupKey = [
+                      voiceGroupId,
+                      String(entry.languageCode || '').trim().toUpperCase(),
+                      String(entry.language || '').trim().toLowerCase()
+                  ].join('||');
+                  if (!groupedEntries.has(groupKey)) {
+                      groupedEntries.set(groupKey, []);
+                  }
+                  groupedEntries.get(groupKey).push(entry);
+              });
+              return [...groupedEntries.values()].flat();
+          })()
+          : resolvedEntries;
+
+      const speakerCounters = {};
+      let globalCounter = 0;
+      return processingEntries.map(entry => {
+          if(!speakerCounters[entry.speaker]) speakerCounters[entry.speaker] = 0;
+          speakerCounters[entry.speaker]++;
+          globalCounter++;
+          return {
+              ...entry,
+              speakerIndex: entry.originalSpeakerIndex || speakerCounters[entry.speaker],
+              downloadIndex: downloadLayout === 'package'
+                  ? (entry.originalDownloadIndex || globalCounter)
+                  : (entry.originalSpeakerIndex || speakerCounters[entry.speaker])
+          };
+      });
   }
 
   function setRunningState() {

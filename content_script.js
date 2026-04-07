@@ -296,14 +296,16 @@ class VoiceoverAutomation {
         const downloadLayout = String(entry.downloadLayout || '').trim().toLowerCase();
         const folderBase = sanitizeFilenamePart(entry.scriptName || this.scriptName || entry.speaker || 'dictor');
         const speakerBase = sanitizeFilenamePart(entry.speaker || entry.originalTag || 'dictor');
+        const sourceFileBase = sanitizeFilenamePart(entry.sourceFileBaseName || entry.sourceFileName || entry.scriptName || '');
         const fileNumber = Number(entry.downloadIndex || entry.speakerIndex || 1);
 
         if (downloadLayout === 'package') {
             const paddedNumber = String(fileNumber).padStart(3, '0');
+            const packagePrefix = [sourceFileBase, speakerBase].filter(Boolean).join('__') || speakerBase || 'dictor';
             return {
                 folderName: folderBase || speakerBase || 'dictor',
-                fileNamePrefix: speakerBase || 'dictor',
-                fullFileName: `${folderBase || speakerBase || 'dictor'}/${paddedNumber}__${speakerBase || 'dictor'}.mp3`
+                fileNamePrefix: packagePrefix,
+                fullFileName: `${folderBase || speakerBase || 'dictor'}/${paddedNumber}__${packagePrefix}.mp3`
             };
         }
 
@@ -650,7 +652,8 @@ class VoiceoverAutomation {
             while (this.isPaused) await this.sleep(500);
 
             const entry = this.queue[this.currentIndex];
-            this.log(`Processing #${this.currentIndex + 1}: Speaker=${entry.speaker}`);
+            const fileLabel = entry.sourceFileName ? ` File=${entry.sourceFileName}` : '';
+            this.log(`Processing #${this.currentIndex + 1}:${fileLabel} Speaker=${entry.speaker}`);
 
             if (entry.text.length > 5000) {
                 this.log('Skipping text > 5000 chars');
@@ -761,16 +764,10 @@ class VoiceoverAutomation {
             return;
         }
 
-        // Проверка активности кнопки
-        let generateBtn = await this.findGenerateButton();
-
-        if (!generateBtn || generateBtn.disabled || generateBtn.classList.contains('opacity-60')) {
+        // Дожидаемся, пока кнопка генерации реально готова к следующему запуску.
+        let generateBtn = await this.waitForGenerateButtonReady();
+        if (!generateBtn) {
             throw new Error('Generate button not active');
-        }
-
-        const btnText = generateBtn.textContent.trim().toLowerCase();
-        if (btnText === 'generating') {
-            await this.waitForButtonState(['regenerate']);
         }
 
         const captureInstallResult = await this.callBridge('ensureAudioCaptureInstalled');
@@ -793,10 +790,8 @@ class VoiceoverAutomation {
             return;
         }
 
-        // Ждем кнопку скачивания
-        this.log('Waiting for download button...');
-        const downloadBtn = await this.waitForNewDownloadButton();
-        if (!downloadBtn) throw new Error('Download button not found (timeout)');
+        // Для нового пайплайна ждём финальный сигнал генерации и только потом забираем аудио.
+        this.log('Waiting for final generation signal...');
 
         if (!this.isRunning) {
             this.log('STOP requested, aborting before download');
@@ -804,8 +799,15 @@ class VoiceoverAutomation {
         }
 
         const fileNameBase = entry.originalTag || entry.speaker || 'dictor';
-        const captureResult = await this.getCapturedAudioData(12000);
-        this.log(`Audio captured via ${captureResult.source || 'unknown'} (${captureResult.size || 0} bytes)`);
+        const captureResult = await this.getCapturedAudioData(300000);
+        const captureSuffix = captureResult.completionReason ? `, ${captureResult.completionReason}` : '';
+        if (captureResult.completionReason) {
+            const finalSignalName = captureResult.completionReason.startsWith('ws_')
+                ? captureResult.completionReason.slice(3)
+                : captureResult.completionReason;
+            this.log(`Final signal observed: ${finalSignalName}`);
+        }
+        this.log(`Audio captured via ${captureResult.source || 'unknown'} (${captureResult.size || 0} bytes${captureSuffix})`);
 
         const downloadRes = await chrome.runtime.sendMessage({
             action: "downloadAudioData",
@@ -814,13 +816,26 @@ class VoiceoverAutomation {
             scriptName: entry.scriptName || null,
             forceIndex: entry.downloadIndex || entry.speakerIndex || null,
             speakerName: entry.speaker || null,
-            downloadLayout: entry.downloadLayout || null
+            downloadLayout: entry.downloadLayout || null,
+            sourceFileName: entry.sourceFileName || null,
+            sourceFileBaseName: entry.sourceFileBaseName || null
         });
         if (!downloadRes || !downloadRes.success) {
             throw new Error(`Audio download failed: ${downloadRes && downloadRes.reason ? downloadRes.reason : 'unknown reason'}`);
         }
         this.log(`Download started (id: ${downloadRes.downloadId || 'n/a'})`);
         this.log(`Download confirmed (index: ${downloadRes.fileNumber || 'n/a'})`);
+
+        this.log('Waiting for MiniMax UI to settle...');
+        generateBtn = await this.waitForGenerateButtonReady(10000);
+        if (!generateBtn) {
+            this.log('MiniMax UI still busy after final signal, waiting grace period...');
+            generateBtn = await this.waitForGenerateButtonReady(10000);
+            if (!generateBtn) {
+                throw new Error('MiniMax UI did not settle after final signal');
+            }
+        }
+        this.log('UI settled, proceeding');
 
           await this.sleep(1500);
           // Очистка в конце, чтобы подготовить почву (но insertText тоже очистит)
@@ -1174,6 +1189,23 @@ class VoiceoverAutomation {
             if (btn && states.some(s => btn.textContent.trim().toLowerCase().includes(s))) return btn;
             await this.sleep(300);
             attempts++;
+        }
+        return null;
+    }
+
+    async waitForGenerateButtonReady(timeout = 30000) {
+        const startedAt = Date.now();
+        while (Date.now() - startedAt < timeout) {
+            const btn = await this.findGenerateButton();
+            if (btn) {
+                const text = String(btn.textContent || '').trim().toLowerCase();
+                const isBusy = text.includes('generating');
+                const isDisabled = !!btn.disabled || btn.classList.contains('opacity-60');
+                if (!isBusy && !isDisabled) {
+                    return btn;
+                }
+            }
+            await this.sleep(300);
         }
         return null;
     }
