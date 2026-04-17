@@ -516,22 +516,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         await chrome.storage.local.set({ downloadHistory: [] });
         sendResponse({ success: true });
 
-      } else if (request.action === "incrementFileCounter") {
-        const tabId = sender.tab?.id ? String(sender.tab.id) : 'fallback-tab';
-        const data = await chrome.storage.local.get('tabVoices');
-        const tabVoices = data.tabVoices || {};
-        let voiceName = tabVoices[tabId] || 'dictor';
-        voiceName = sanitizeFilename(voiceName);
-
-        // ИСПРАВЛЕНО: Формат "ScriptName - SpeakerName"
-        let folderName = voiceName;
-        if (request.scriptName) {
-            const sanitizedScriptName = sanitizeFilename(request.scriptName);
-            folderName = `${sanitizedScriptName} - ${voiceName}`;
-        }
-
-        const fileNumber = await getNextFileNumber(folderName);
-        sendResponse({ success: true, skippedNumber: fileNumber });
       } else if (request.action === "saveSkippedEntries") {
         // Сохранение пропущенных записей
         const key = request.mode === 'multi' ? 'skippedEntriesMulti' : 'skippedEntries';
@@ -963,83 +947,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             return await capture.consumeCapturedAudio(timeout);
           },
 
-          getLatestAudioDataUrl: async function(timeout) {
-            var capture = window.__minimaxAudioCapture;
-            if (!capture || !capture.installed || typeof capture.consumeCapturedAudio !== 'function') {
-              return { ok: false, reason: 'capture_not_installed' };
-            }
-            return await capture.consumeCapturedAudio(timeout);
-          },
-
-          triggerMp3Download: function() {
-            function isVisibleElement(el) {
-              if (!el) return false;
-              var style = window.getComputedStyle(el);
-              if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-              var rect = el.getBoundingClientRect();
-              return rect.width > 0 && rect.height > 0;
-            }
-
-            function findMp3Item() {
-              var dropdowns = Array.from(document.querySelectorAll('.ant-dropdown, [role="menu"]'))
-                .filter(function(el) { return isVisibleElement(el) && !el.classList.contains('ant-dropdown-hidden'); });
-
-              for (var i = 0; i < dropdowns.length; i++) {
-                var items = Array.from(dropdowns[i].querySelectorAll('li[role="menuitem"], .ant-dropdown-menu-item, [role="menuitem"]'));
-                var byId = items.find(function(item) {
-                  var dataMenuId = String(item.getAttribute('data-menu-id') || '').toLowerCase();
-                  return dataMenuId.includes('tts_no_watermark') && !dataMenuId.includes('wav');
-                });
-                if (byId) return byId;
-
-                var byText = items.find(function(item) {
-                  var text = String(item.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                  return text.includes('mp3');
-                });
-                if (byText) return byText;
-              }
-
-              return null;
-            }
-
-            function invokeReactClick(el) {
-              var current = el;
-              while (current) {
-                var propsKey = Object.keys(current).find(function(k) { return k.startsWith('__reactProps$'); });
-                if (propsKey && current[propsKey]) {
-                  var props = current[propsKey];
-                  if (typeof props.onClick === 'function') {
-                    props.onClick({
-                      type: 'click',
-                      target: el,
-                      currentTarget: current,
-                      nativeEvent: new MouseEvent('click', { bubbles: true, cancelable: true, view: window }),
-                      preventDefault: function() {},
-                      stopPropagation: function() {}
-                    });
-                    return { ok: true, mode: 'react-onClick' };
-                  }
-                }
-                current = current.parentElement;
-              }
-              return { ok: false, mode: 'react-onClick-missing' };
-            }
-
-            var item = findMp3Item();
-            if (!item) {
-              return { ok: false, reason: 'mp3_item_not_found' };
-            }
-
-            var invoked = invokeReactClick(item);
-            if (invoked.ok) {
-              return invoked;
-            }
-
-            item.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-            item.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-            item.click();
-            return { ok: true, mode: 'native-click-fallback' };
-          }
         };
 
         const func = slateFunctions[request.method];

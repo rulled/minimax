@@ -44,55 +44,6 @@ function isVisibleElement(el) {
   return rect.width > 0 && rect.height > 0;
 }
 
-function findMp3OptionInOpenDropdown() {
-  const dropdowns = Array.from(document.querySelectorAll('.ant-dropdown, [role="menu"]'))
-    .filter((el) => isVisibleElement(el) && !el.classList.contains('ant-dropdown-hidden'));
-
-  for (const dropdown of dropdowns) {
-    const items = Array.from(dropdown.querySelectorAll('li[role="menuitem"], .ant-dropdown-menu-item, [role="menuitem"]'));
-    if (!items.length) continue;
-
-    let mp3Item = items.find((item) => {
-      const dataMenuId = String(item.getAttribute('data-menu-id') || '').toLowerCase();
-      return dataMenuId.includes('tts_no_watermark') && !dataMenuId.includes('wav');
-    });
-
-    if (!mp3Item) {
-      mp3Item = items.find((item) => {
-        const text = String(item.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-        return text.includes('mp3');
-      });
-    }
-
-    if (mp3Item) return mp3Item;
-  }
-
-  return null;
-}
-
-async function clickMp3FromDownloadMenu(maxWaitMs = 4000, intervalMs = 120) {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < maxWaitMs) {
-    const mp3Item = findMp3OptionInOpenDropdown();
-    if (mp3Item) {
-      mp3Item.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-      mp3Item.click();
-      return true;
-    }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-  return false;
-}
-
-function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error || new Error('Failed to read blob'));
-    reader.readAsDataURL(blob);
-  });
-}
-
 function sanitizeFilenamePart(value) {
   return String(value || '')
     .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
@@ -1082,84 +1033,6 @@ class VoiceoverAutomation {
         return document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
     }
 
-    // Проверка на ошибки UI (тосты, сообщения об ошибках)
-    checkForUiErrors() {
-        // Селекторы для разных типов ошибок Minimax
-        const errorSelectors = [
-            '.ant-message-error',
-            '.Toastify__toast--error',
-            '.ant-notification-notice-error',
-            '[class*="error"]',
-            '[class*="Error"]'
-        ];
-        
-        for (const selector of errorSelectors) {
-            const errorEl = document.querySelector(selector);
-            if (errorEl && errorEl.textContent) {
-                const text = errorEl.textContent.trim();
-                // Фильтруем ложные срабатывания
-                if (text.length > 0 && text.length < 500) {
-                    return text;
-                }
-            }
-        }
-        return null;
-    }
-
-    async waitForNewDownloadButton() {
-        return new Promise((resolve, reject) => {
-            const maxWait = 120000;
-            const startTime = Date.now();
-            
-            const check = () => {
-                // 1. Проверка на ошибки UI
-                const uiError = this.checkForUiErrors();
-                if (uiError) {
-                    this.log(`UI Error detected: ${uiError}`);
-                    return { error: uiError };
-                }
-
-                // 2. Поиск кнопки скачивания
-                const paths = document.querySelectorAll('path[d^="M12.3984 13.6006H3.59844"]');
-                if (paths.length > 0) {
-                    const btn = paths[paths.length - 1].closest('div.cursor-pointer');
-                    if (btn && !btn.classList.contains('opacity-40')) {
-                        return { btn };
-                    }
-                }
-                return null;
-            };
-            
-            const interval = setInterval(() => {
-                if (!this.isRunning) {
-                    clearInterval(interval);
-                    reject(new Error('Stopped'));
-                    return;
-                }
-
-                const result = check();
-                
-                if (result) {
-                    if (result.error) {
-                        clearInterval(interval);
-                        reject(new Error(`UI Error: ${result.error}`));
-                        return;
-                    }
-                    if (result.btn) {
-                        clearInterval(interval);
-                        resolve(result.btn);
-                        return;
-                    }
-                }
-
-                if (Date.now() - startTime > maxWait) {
-                    clearInterval(interval);
-                    reject(new Error('Timeout waiting for download button'));
-                }
-            }, 1000);
-        });
-    }
-
     async getCapturedAudioData(timeout = 10000) {
         const result = await this.callBridge('consumeCapturedAudio', timeout);
         if (!result || !result.ok) {
@@ -1180,17 +1053,6 @@ class VoiceoverAutomation {
             const text = btn.textContent.toLowerCase();
             return (text.includes('generate') || text.includes('create') || text.includes('regenerate')) && !btn.closest('.nav-list'); 
         });
-    }
-
-    async waitForButtonState(states) {
-        let attempts = 0;
-        while(attempts < 200) {
-            const btn = await this.findGenerateButton();
-            if (btn && states.some(s => btn.textContent.trim().toLowerCase().includes(s))) return btn;
-            await this.sleep(300);
-            attempts++;
-        }
-        return null;
     }
 
     async waitForGenerateButtonReady(timeout = 30000) {
