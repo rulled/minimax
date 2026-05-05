@@ -78,34 +78,6 @@ function parseMarkdown(markdownText) {
 
   const headerRegex = /^(?:\\)?\*\*(?:\\)?\*?(.+?)(?:\\)?\*?(?:\\)?\*\*(?:\s*:)?(.*)$/;
 
-  function parsePlainSpeakerHeader(line) {
-    const match = String(line || '').match(/^([A-Za-zА-Яа-яЁё0-9 _+().,'"-]{1,120}?):(?:\s*(.*))?$/);
-    if (!match) return null;
-
-    const rawSpeaker = match[1].trim();
-    const inlineText = (match[2] || '').trim();
-    const words = rawSpeaker.split(/\s+/).filter(Boolean);
-    const wordCount = words.length;
-    const hasForbiddenPunctuation = /[.!?;«»]/.test(rawSpeaker);
-    const hasSpeakerLikeSignal = words.every((word) => {
-      const normalizedWord = word.replace(/^[()"']+|[()"',-]+$/g, '');
-      if (!normalizedWord) return true;
-      if (/^\d+$/.test(normalizedWord)) return true;
-      if (/^[A-ZА-ЯЁ0-9]+(?:[()_-][A-ZА-ЯЁ0-9]+)*$/.test(normalizedWord)) return true;
-      if (/^[A-ZА-ЯЁ][a-zа-яё]+(?:-[A-ZА-ЯЁ][a-zа-яё]+)?$/.test(normalizedWord)) return true;
-      return false;
-    });
-    const isSingleWordUppercase = wordCount === 1 && /^[A-ZА-ЯЁ0-9]+(?:[()_-][A-ZА-ЯЁ0-9]+)*$/.test(words[0]);
-
-    if (hasForbiddenPunctuation || !hasSpeakerLikeSignal || wordCount === 0 || wordCount > 6) return null;
-    if (wordCount === 1 && !isSingleWordUppercase) return null;
-
-    return {
-      rawSpeaker,
-      inlineText
-    };
-  }
-
   function finalizeCurrentEntry() {
     if (!currentEntry || !currentEntry.text.trim()) return;
     entries.push({
@@ -138,13 +110,12 @@ function parseMarkdown(markdownText) {
     }
 
     const headerMatch = line.match(headerRegex);
-    const plainHeaderMatch = headerMatch ? null : parsePlainSpeakerHeader(line);
 
-    if (headerMatch || plainHeaderMatch) {
+    if (headerMatch) {
       finalizeCurrentEntry();
 
-      let rawSpeaker = headerMatch ? headerMatch[1].trim() : plainHeaderMatch.rawSpeaker;
-      let inlineText = headerMatch ? (headerMatch[2] ? headerMatch[2].trim() : '') : plainHeaderMatch.inlineText;
+      let rawSpeaker = headerMatch[1].trim();
+      let inlineText = headerMatch[2] ? headerMatch[2].trim() : '';
       let finalSpeaker = normalizeSpeakerName(rawSpeaker);
 
       currentEntry = {
