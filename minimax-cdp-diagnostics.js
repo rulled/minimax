@@ -9,17 +9,23 @@ async function getTargets() {
   return fetch(`${CDP_BASE_URL}/json/list`).then((response) => response.json());
 }
 
-async function evaluate(target, expression) {
+async function evaluate(target, expression, timeoutMs = 15000) {
   const socket = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => {
-    socket.onopen = resolve;
-    socket.onerror = reject;
+    const timer = setTimeout(() => reject(new Error(`websocket open timeout: ${target.url || target.type}`)), timeoutMs);
+    socket.onopen = () => { clearTimeout(timer); resolve(); };
+    socket.onerror = (error) => { clearTimeout(timer); reject(new Error(`websocket error: ${target.url || target.type}`)); };
+  }).catch((error) => {
+    try { socket.close(); } catch (_) {}
+    throw error;
   });
 
   return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`evaluate timeout: ${target.url || target.type}`)), timeoutMs);
     socket.onmessage = (event) => {
       const message = JSON.parse(event.data);
       if (message.id !== 1) return;
+      clearTimeout(timer);
       socket.close();
       if (message.error) return reject(new Error(message.error.message));
       if (message.result?.exceptionDetails) {
@@ -33,6 +39,64 @@ async function evaluate(target, expression) {
       params: { expression, awaitPromise: true, returnByValue: true },
     }));
   });
+}
+
+// Ищем именно НАШ service worker среди всех расширений профиля
+// (в профиле могут висеть чужие SW, например Google Docs Offline).
+// Спящий MV3 SW не отдаётся /json/list — будим открытием popup как вкладки.
+async function findExtensionWorker(targets, { wake = true } = {}) {
+  const findOnce = async () => {
+    const list = await getTargets();
+    const candidates = list.filter((target) => (
+      (target.type === 'service_worker' || target.type === 'worker')
+        && String(target.url || '').startsWith('chrome-extension://')
+    ));
+    for (const candidate of candidates) {
+      try {
+        const name = await evaluate(candidate, 'chrome.runtime.getManifest().name');
+        if (name === 'MiniMax TTS Automation') return candidate;
+      } catch (_) { /* не наш или не отвечает */ }
+    }
+    return null;
+  };
+  const resolveExtensionId = async () => {
+    const list = await getTargets();
+    const fromTarget = list.map((t) => t.url).find((u) => String(u || '').startsWith('chrome-extension://'));
+    if (fromTarget) return fromTarget.split('/')[2];
+    // Спящий SW не виден — читаем id со страницы chrome://extensions
+    const extensionsPage = list.find((target) => target.type === 'page' && target.url.startsWith('chrome://extensions'));
+    if (!extensionsPage) return null;
+    try {
+      return await evaluate(extensionsPage, `(() => {
+        const list = document.querySelector('extensions-manager')?.shadowRoot?.querySelector('extensions-item-list');
+        const item = [...(list?.shadowRoot?.querySelectorAll('extensions-item') || [])]
+          .find((entry) => entry.data?.name === 'MiniMax TTS Automation');
+        return item?.data?.id || null;
+      })()`);
+    } catch (_) {
+      return null;
+    }
+  };
+
+  let worker = await findOnce();
+  if (worker || !wake) return worker;
+
+  try {
+    // Открытие popup-страницы расширения гарантированно поднимает SW.
+    const extensionId = await resolveExtensionId();
+    if (!extensionId) return null;
+    const res = await fetch(`${CDP_BASE_URL}/json/new?chrome-extension://${extensionId}/popup.html`, { method: 'PUT' });
+    const tab = await res.json();
+    try {
+      for (let attempt = 0; attempt < 10 && !worker; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        worker = await findOnce();
+      }
+    } finally {
+      await fetch(`${CDP_BASE_URL}/json/close/${tab.id}`).catch(() => {});
+    }
+  } catch (_) { /* popup мог не открыться — отдадим что нашли */ }
+  return worker;
 }
 
 async function main() {
@@ -147,8 +211,8 @@ async function main() {
   }
 
   if (process.argv.includes('--extension-worker-info')) {
-    const worker = targets.find((target) => target.type === 'worker');
-    if (!worker) throw new Error('extension service worker not found');
+    const worker = await findExtensionWorker(targets);
+    if (!worker) throw new Error('MiniMax TTS Automation service worker not found (is the extension enabled?)');
     const result = await evaluate(worker, `(async () => ({
       runtimeId: chrome.runtime.id,
       tabs: (await chrome.tabs.query({ url: 'https://www.minimax.io/audio/text-to-speech*' }))
@@ -162,8 +226,8 @@ async function main() {
   // Читаем storage напрямую из воркера — работает даже когда попап закрыт.
   // --extension-logs [--tail N] [--clear-logs] [--out file.json]
   if (process.argv.includes('--extension-logs')) {
-    const worker = targets.find((target) => target.type === 'worker' || target.type === 'service_worker');
-    if (!worker) throw new Error('extension service worker not found (open a MiniMax tab or chrome://extensions to wake it)');
+    const worker = await findExtensionWorker(targets);
+    if (!worker) throw new Error('MiniMax TTS Automation service worker not found (is the extension enabled? is a MiniMax tab open?)');
     const tailIndex = process.argv.indexOf('--tail');
     const tail = tailIndex >= 0 ? Math.max(1, Number(process.argv[tailIndex + 1] || 0)) : null;
     const shouldClear = process.argv.includes('--clear-logs');
