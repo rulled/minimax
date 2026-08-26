@@ -158,6 +158,42 @@ async function main() {
     return;
   }
 
+  // Выгрузка диагностического журнала расширения (diag_log.js).
+  // Читаем storage напрямую из воркера — работает даже когда попап закрыт.
+  // --extension-logs [--tail N] [--clear-logs] [--out file.json]
+  if (process.argv.includes('--extension-logs')) {
+    const worker = targets.find((target) => target.type === 'worker' || target.type === 'service_worker');
+    if (!worker) throw new Error('extension service worker not found (open a MiniMax tab or chrome://extensions to wake it)');
+    const tailIndex = process.argv.indexOf('--tail');
+    const tail = tailIndex >= 0 ? Math.max(1, Number(process.argv[tailIndex + 1] || 0)) : null;
+    const shouldClear = process.argv.includes('--clear-logs');
+    const outIndex = process.argv.indexOf('--out');
+    const result = await evaluate(worker, `(async () => {
+      const stored = await chrome.storage.local.get('diagLogEvents');
+      const events = Array.isArray(stored.diagLogEvents) ? stored.diagLogEvents : [];
+      return {
+        count: events.length,
+        runtimeId: chrome.runtime.id,
+        events
+      };
+    })()`).then(async (data) => {
+      if (shouldClear) {
+        await evaluate(worker, `chrome.storage.local.set({ diagLogEvents: [] })`);
+      }
+      return data;
+    });
+    let events = result.events || [];
+    if (tail) events = events.slice(-tail);
+    const outPath = outIndex >= 0 ? process.argv[outIndex + 1] : null;
+    if (outPath) {
+      fs.writeFileSync(outPath, JSON.stringify({ exportedAt: new Date().toISOString(), count: events.length, events }, null, 2));
+      console.log(`Wrote ${events.length} events to ${outPath}`);
+    } else {
+      console.log(JSON.stringify({ count: events.length, events }, null, 2));
+    }
+    return;
+  }
+
   if (process.argv.includes('--extension-controls')) {
     if (!extensionsPage) throw new Error('chrome://extensions target not found');
     const result = await evaluate(extensionsPage, `(() => {

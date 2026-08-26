@@ -1,5 +1,17 @@
 ﻿// Храним состояние расширения
 let extensionEnabled = false;
+
+// Глобальные ошибки контент-скрипта — в диагностический журнал (diag_log.js грузится раньше по манифесту)
+window.addEventListener('error', (event) => {
+  try {
+    DiagLog.error('content', 'Uncaught error', { message: event.message, filename: event.filename, lineno: event.lineno });
+  } catch (_) {}
+});
+window.addEventListener('unhandledrejection', (event) => {
+  try {
+    DiagLog.error('content', 'Unhandled rejection', { reason: event.reason?.message || String(event.reason) });
+  } catch (_) {}
+});
 let isInitialized = false;
 let automationOverrideIndex = null;
 let automationOverrideSpeaker = null; 
@@ -168,6 +180,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       automation.setQueue(request.queue);
       automation.setMode(request.mode || 'single');
       automation.setScriptName(request.scriptName || null);
+      DiagLog.info('automation', 'Воркер принял очередь', {
+        runId: request.runId || null,
+        workerId: request.workerId || null,
+        mode: request.mode || 'single',
+        queueSize: request.queue?.length || 0
+      });
       automation.start();
       sendResponse({ success: true });
     }).catch((error) => sendResponse({ success: false, reason: error.message }));
@@ -1110,11 +1128,19 @@ class VoiceoverAutomation {
                 }
 
                 entry.status = 'completed';
+                DiagLog.info('entry', 'Реплика готова', { speaker: entry.speaker, voiceId: entry.voiceId });
                 this.notifyProgress();
                 this.currentIndex++;
                 await this.sleep(1000);
             } catch (error) {
                 this.error(`Failed processing entry #${this.currentIndex}`, error);
+                DiagLog.warn('entry', 'Ошибка обработки реплики', {
+                    speaker: entry.speaker,
+                    voiceId: entry.voiceId,
+                    attempt: Number(entry.attempt || 0) + 1,
+                    paidSubmissionStarted: !!entry.paidSubmissionStarted,
+                    error: error.message
+                });
                 entry.attempt = Number(entry.attempt || 0) + 1;
                 if (!entry.paidSubmissionStarted
                     && !entry.submissionRejected
@@ -1312,6 +1338,12 @@ class VoiceoverAutomation {
                 }
             });
             if (!directResult?.ok && ['not_sent', 'not_invoked'].includes(directResult?.disposition)) {
+                DiagLog.warn('direct', 'Прямая отправка не состоялась (не оплачено)', {
+                    speaker: entry.speaker,
+                    disposition: directResult?.disposition,
+                    code: directResult?.code ?? null,
+                    reason: directResult?.reason || null
+                });
                 entry.paidSubmissionStarted = false;
                 const ledgerRelease = await chrome.runtime.sendMessage({
                     action: 'completeRegularSubmission',
@@ -1333,6 +1365,12 @@ class VoiceoverAutomation {
                 }
                 throw new Error(`Direct generation was not sent: ${directResult?.reason || directResult?.disposition || 'unknown'}`);
             } else if (!directResult?.ok) {
+                DiagLog.warn('direct', 'Прямая отправка в неоднозначном состоянии — нужна сверка с History', {
+                    speaker: entry.speaker,
+                    disposition: directResult?.disposition,
+                    code: directResult?.code ?? null,
+                    reason: directResult?.reason || null
+                });
                 if (directResult?.disposition === 'rejected') {
                     const ledgerCleanup = await chrome.runtime.sendMessage({
                         action: 'completeRegularSubmission',
@@ -1356,6 +1394,12 @@ class VoiceoverAutomation {
                 throw new Error(`Direct generation may have been accepted: ${directResult?.reason || directResult?.disposition || 'unknown'}`);
             } else {
                 this.log(`Direct audio completed (${directResult.size || 0} bytes)`);
+                DiagLog.info('direct', 'Генерация готова', {
+                    speaker: entry.speaker,
+                    voiceId: entry.voiceId,
+                    bytes: directResult.size || 0,
+                    durationMs: directResult.durationMs ?? null
+                });
             }
 
         const fileNameBase = entry.originalTag || entry.speaker || 'dictor';
@@ -1760,6 +1804,14 @@ class VoiceoverAutomation {
         }).catch(()=>{});
     }
     notifyComplete(error = null) {
+        DiagLog.info('automation', 'Воркер закончил очередь', {
+            runId: this.runId,
+            workerId: this.workerId,
+            success: !error,
+            completed: this.currentIndex,
+            total: this.queue.length,
+            error: error?.message || null
+        });
         chrome.runtime.sendMessage({
             action: 'automationComplete',
             success: !error,
@@ -1781,10 +1833,14 @@ class VoiceoverAutomation {
     notifyPause() { chrome.runtime.sendMessage({ action: 'automationPaused', runId: this.runId, workerId: this.workerId }).catch(()=>{}); this.updateState(); }
     notifyResume() { chrome.runtime.sendMessage({ action: 'automationResumed', runId: this.runId, workerId: this.workerId }).catch(()=>{}); this.updateState(); }
     notifyStop() {
+        DiagLog.info('automation', 'Воркер остановлен', { runId: this.runId, workerId: this.workerId, completed: this.currentIndex, total: this.queue.length });
         chrome.runtime.sendMessage({ action: 'automationStopped', runId: this.runId, workerId: this.workerId }).catch(()=>{});
         chrome.runtime.sendMessage({ action: 'clearAutomationState', runId: this.runId, workerId: this.workerId }).catch(()=>{});
     }
-    notifyError(msg) { chrome.runtime.sendMessage({ action: 'automationError', error: msg, runId: this.runId, workerId: this.workerId }).catch(()=>{}); }
+    notifyError(msg) {
+        DiagLog.error('automation', 'Воркер сообщил об ошибке', { runId: this.runId, workerId: this.workerId, error: msg });
+        chrome.runtime.sendMessage({ action: 'automationError', error: msg, runId: this.runId, workerId: this.workerId }).catch(()=>{});
+    }
 
     updateState() {
         chrome.runtime.sendMessage({

@@ -981,6 +981,16 @@
           <button class="btn btn-danger-outline btn-block" id="voiceCleanupDeleteButton">Удалить 20 старых голосов</button>
           <div id="voiceCleanupStatus" class="voice-source-status"></div>
         </section>
+
+        <section class="card">
+          <div class="counter-container">
+            <span class="counter-label">диагностика</span>
+            <span class="counter-value" id="diagLogCount" title="Событий в журнале">0</span>
+          </div>
+          <button class="btn btn-outline btn-block" id="diagExportButton">Экспорт логов (JSON)</button>
+          <button class="btn btn-danger-outline btn-block" id="diagClearButton">Очистить журнал</button>
+          <div id="diagLogStatus" class="voice-source-status"></div>
+        </section>
       </div>
     </div>
 
@@ -1168,6 +1178,7 @@
   </div>
 
   <script src="parser.js"></script>
+  <script src="diag_log.js"></script>
   <script src="voice_mapping.js"></script>
   <script src="popup.js"></script>
 </body>

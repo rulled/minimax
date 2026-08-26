@@ -1,3 +1,15 @@
+// Ловим ошибки попапа в диагностический журнал (до DOMContentLoaded, чтобы поймать ранние падения)
+window.addEventListener('error', (event) => {
+  try {
+    DiagLog.error('popup', 'Uncaught error', { message: event.message, filename: event.filename, lineno: event.lineno });
+  } catch (_) {}
+});
+window.addEventListener('unhandledrejection', (event) => {
+  try {
+    DiagLog.error('popup', 'Unhandled rejection', { reason: event.reason?.message || String(event.reason) });
+  } catch (_) {}
+});
+
 document.addEventListener('DOMContentLoaded', async () => {
   // ============================================
   // 1. ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
@@ -106,6 +118,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   const voiceCleanupCapacityFill = document.getElementById('voiceCleanupCapacityFill');
   const voiceCleanupDeleteButton = document.getElementById('voiceCleanupDeleteButton');
   const voiceCleanupStatus = document.getElementById('voiceCleanupStatus');
+  const diagLogCount = document.getElementById('diagLogCount');
+  const diagExportButton = document.getElementById('diagExportButton');
+  const diagClearButton = document.getElementById('diagClearButton');
+  const diagLogStatus = document.getElementById('diagLogStatus');
 
   // Автоозвучка (Single)
   const uploadButton = document.getElementById('uploadButton');
@@ -935,6 +951,62 @@ document.addEventListener('DOMContentLoaded', async () => {
           await chrome.storage.local.set({fileCounters: fc});
           updateCounterDisplay();
           scheduleSaveUiState();
+      }
+  };
+
+  // Диагностический журнал: счётчик, экспорт, очистка
+  async function refreshDiagLogCount() {
+      if (!diagLogCount || typeof DiagLog === 'undefined') return;
+      try {
+          const events = await DiagLog.dump();
+          diagLogCount.textContent = String(events.length);
+      } catch (_) { /* журнал недоступен */ }
+  }
+  refreshDiagLogCount();
+
+  if (diagExportButton) diagExportButton.onclick = async () => {
+      try {
+          if (typeof DiagLog === 'undefined') throw new Error('DiagLog не загружен');
+          const events = await DiagLog.dump();
+          const payload = {
+              exportedAt: new Date().toISOString(),
+              extensionVersion: chrome.runtime.getManifest().version,
+              eventCount: events.length,
+              events
+          };
+          const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const anchor = document.createElement('a');
+          anchor.href = url;
+          anchor.download = `minimax-diag-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+          anchor.click();
+          setTimeout(() => URL.revokeObjectURL(url), 5000);
+          if (diagLogStatus) {
+              diagLogStatus.textContent = `Экспортировано событий: ${events.length}`;
+              diagLogStatus.className = 'voice-source-status success';
+          }
+      } catch (error) {
+          if (diagLogStatus) {
+              diagLogStatus.textContent = `Экспорт не удался: ${error.message}`;
+              diagLogStatus.className = 'voice-source-status error';
+          }
+      }
+  };
+
+  if (diagClearButton) diagClearButton.onclick = async () => {
+      try {
+          if (typeof DiagLog === 'undefined') throw new Error('DiagLog не загружен');
+          await DiagLog.clear();
+          if (diagLogStatus) {
+              diagLogStatus.textContent = 'Журнал очищен';
+              diagLogStatus.className = 'voice-source-status success';
+          }
+          refreshDiagLogCount();
+      } catch (error) {
+          if (diagLogStatus) {
+              diagLogStatus.textContent = `Очистка не удалась: ${error.message}`;
+              diagLogStatus.className = 'voice-source-status error';
+          }
       }
   };
 

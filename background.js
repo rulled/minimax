@@ -1,6 +1,21 @@
 ﻿// Состояние расширения
 let extensionEnabled = false;
 
+// Диагностический журнал (diag_log.js должен быть загружен первым — см. importScripts)
+importScripts('diag_log.js');
+
+// Глобальные ошибки service worker'а — в диагностический журнал.
+self.addEventListener('error', (event) => {
+  try {
+    DiagLog.error('sw', 'Uncaught error', { message: event.message, filename: event.filename, lineno: event.lineno });
+  } catch (_) {}
+});
+self.addEventListener('unhandledrejection', (event) => {
+  try {
+    DiagLog.error('sw', 'Unhandled rejection', { reason: event.reason?.message || String(event.reason) });
+  } catch (_) {}
+});
+
 // "Бронь" для следующего скачивания (для новых DIV-кнопок без href)
 let nextDownloadConfig = null;
 const PRIME_TTL_MS = 120000;
@@ -3096,7 +3111,7 @@ function sendTabMessageWithTimeout(tabId, message, timeoutMs = 10000) {
           return;
         }
         try {
-          await chrome.scripting.executeScript({ target: { tabId }, files: ['voice_mapping.js', 'content_script.js'] });
+          await chrome.scripting.executeScript({ target: { tabId }, files: ['diag_log.js', 'voice_mapping.js', 'content_script.js'] });
           await sleep(250);
           const response = await chrome.tabs.sendMessage(tabId, message);
           finish(resolve, response);
@@ -3170,6 +3185,14 @@ function buildRemainingParallelJobs() {
 
 async function finishParallelBatch() {
   const secondaryTabId = parallelBatchState.secondaryTabId;
+  DiagLog.info('parallel', 'Двухпоточный пакет завершён', {
+    runId: parallelBatchState.runId,
+    workers: (parallelBatchState.workers || []).map((worker) => ({
+      workerId: worker.workerId,
+      total: worker.total,
+      status: worker.status
+    }))
+  });
   parallelBatchState = getDefaultParallelBatchState();
   await saveParallelBatchState();
   await chrome.alarms.clear('parallelBatchWatchdog');
@@ -3185,6 +3208,16 @@ async function fallbackParallelBatch(reason) {
   await loadParallelBatchState();
   if (!parallelBatchState.isRunning || parallelBatchState.isFallingBack) return;
 
+  DiagLog.warn('parallel', 'Откат двух потоков в один', {
+    reason,
+    runId: parallelBatchState.runId,
+    workers: (parallelBatchState.workers || []).map((worker) => ({
+      workerId: worker.workerId,
+      currentIndex: worker.currentIndex,
+      total: worker.total,
+      status: worker.status
+    }))
+  });
   parallelBatchState.isFallingBack = true;
   await saveParallelBatchState();
 
@@ -3569,6 +3602,13 @@ async function initializeLegacyBatchState() {
 
 async function startLongTextAwareBatch(jobs, tabId, useParallel) {
   await Promise.all([loadBatchState(), loadParallelBatchState(), loadLongTextState()]);
+  DiagLog.info('batch', 'Запуск пакета', {
+    mode: useParallel ? 'parallel' : 'single',
+    jobs: jobs.length,
+    entries: jobs.reduce((sum, job) => sum + (job.queue?.length || 0), 0),
+    longText: jobs.reduce((sum, job) => sum + (job.queue || []).filter((entry) => entry.isLongText).length, 0),
+    tabId
+  });
   assertLongTextLimits(jobs);
   if (batchState.activeJob || batchState.recoveryRequired) {
     return { success: false, reason: 'legacy_batch_reconciliation_required' };
@@ -3625,13 +3665,15 @@ async function startLongTextAwareBatch(jobs, tabId, useParallel) {
     }
   }
 
-  return {
+  const outcome = {
     ...regularResult,
     success: regularResult.success !== false,
     regularStarted: regularJobs.length > 0,
     longTextSubmitted: longTextResult.submitted,
     longTextFailed: longTextResult.failed
   };
+  DiagLog.info('batch', 'Пакет запущен', outcome);
+  return outcome;
 }
 
 // Инициализация при пробуждении Service Worker

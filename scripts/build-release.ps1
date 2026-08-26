@@ -21,6 +21,7 @@ $includeFiles = @(
   "parser.js",
   "popup.html",
   "popup.js",
+  "diag_log.js",
   "voice_mapping.js",
   "README.md"
 )
