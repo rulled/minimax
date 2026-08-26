@@ -512,6 +512,11 @@
       place-content: center;
       transition: all 0.2s ease;
     }
+
+    .btn:disabled {
+      cursor: wait;
+      opacity: 0.55;
+    }
     .md-checkbox::after {
       content: "";
       width: 10px;
@@ -719,6 +724,22 @@
       border: 1px solid var(--md-sys-color-outline);
     }
 
+    .voice-capacity-track {
+      height: 5px;
+      margin: 10px 0;
+      overflow: hidden;
+      border-radius: 999px;
+      background: var(--md-sys-color-surface-variant);
+    }
+
+    .voice-capacity-fill {
+      width: 0;
+      height: 100%;
+      border-radius: inherit;
+      background: var(--md-sys-color-primary);
+      transition: width 180ms ease-out;
+    }
+
     .history-filename { word-break: break-all; margin-bottom: 4px; color: var(--md-sys-color-on-surface); }
     .history-time { color: var(--md-sys-color-on-surface-variant); font-size: 11px; }
 
@@ -907,6 +928,16 @@
         </section>
 
         <section class="card">
+          <div class="toggle-label">Прямой TTS</div>
+          <div class="helper-text">Все генерации используют прямой API-транспорт.</div>
+          <div id="directTtsStatus" class="voice-source-status"></div>
+          <div id="submissionRecoveryArea" style="display: none; margin-top: 10px;">
+            <div id="submissionRecoveryStatus" class="voice-source-status"></div>
+            <button id="resolveSubmissionRecoveryButton" class="btn btn-danger-outline btn-block">History проверена — снять блокировку</button>
+          </div>
+        </section>
+
+        <section class="card">
           <div class="form-group">
             <label>выбор голоса</label>
             <div class="custom-select-container">
@@ -935,6 +966,20 @@
           </div>
           <button class="btn btn-danger-outline btn-block" id="resetButton">сбросить настройки</button>
           <p id="status"></p>
+        </section>
+
+        <section class="card">
+          <div class="row">
+            <div>
+              <div class="toggle-label">слоты голосов</div>
+              <div id="voiceCleanupQuota" class="helper-text">проверка при удалении</div>
+            </div>
+          </div>
+          <div class="voice-capacity-track" aria-hidden="true">
+            <div id="voiceCleanupCapacityFill" class="voice-capacity-fill"></div>
+          </div>
+          <button class="btn btn-danger-outline btn-block" id="voiceCleanupDeleteButton">Удалить 20 старых голосов</button>
+          <div id="voiceCleanupStatus" class="voice-source-status"></div>
         </section>
       </div>
     </div>
@@ -1058,6 +1103,7 @@
             <div class="form-group">
               <label>настройка голосов (для всех файлов)</label>
               <div id="voiceMappingList" style="display: flex; flex-direction: column; gap: 8px; max-height: 250px; overflow-y: auto;"></div>
+              <div id="voiceMappingInspectionStatus" class="voice-source-status"></div>
             </div>
           </section>
 
@@ -1122,6 +1168,7 @@
   </div>
 
   <script src="parser.js"></script>
+  <script src="voice_mapping.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

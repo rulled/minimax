@@ -5,6 +5,152 @@ let extensionEnabled = false;
 let nextDownloadConfig = null;
 const PRIME_TTL_MS = 120000;
 let pendingNamedDownloads = [];
+const REGULAR_SUBMISSION_LEDGER_KEY = 'regularSubmissionLedger';
+let regularSubmissionLedgerQueue = Promise.resolve();
+let longTextSubmissionQueue = Promise.resolve();
+
+function queueRegularSubmissionLedger(operation) {
+  const result = regularSubmissionLedgerQueue.then(operation);
+  regularSubmissionLedgerQueue = result.catch(() => {});
+  return result;
+}
+
+function queueLongTextSubmission(operation) {
+  const result = longTextSubmissionQueue.then(operation);
+  longTextSubmissionQueue = result.catch(() => {});
+  return result;
+}
+
+async function getUnresolvedRegularSubmissions() {
+  const data = await chrome.storage.local.get(REGULAR_SUBMISSION_LEDGER_KEY);
+  const ledger = Array.isArray(data[REGULAR_SUBMISSION_LEDGER_KEY]) ? data[REGULAR_SUBMISSION_LEDGER_KEY] : [];
+  return ledger.filter((entry) => entry && entry.completedAt == null);
+}
+
+async function saveRegularSubmission(entry) {
+  const unresolved = await getUnresolvedRegularSubmissions();
+  const next = unresolved.filter((item) => item.submissionId !== entry.submissionId);
+  next.push(entry);
+  await chrome.storage.local.set({ [REGULAR_SUBMISSION_LEDGER_KEY]: next });
+}
+
+async function completeRegularSubmission(submissionId) {
+  const unresolved = await getUnresolvedRegularSubmissions();
+  await chrome.storage.local.set({
+    [REGULAR_SUBMISSION_LEDGER_KEY]: unresolved.filter((entry) => entry.submissionId !== submissionId)
+  });
+}
+
+async function updateRegularSubmission(submissionId, changes, ownerTabId = null) {
+  const unresolved = await getUnresolvedRegularSubmissions();
+  const entry = unresolved.find((item) => item.submissionId === submissionId);
+  if (!entry) throw new Error('regular_submission_not_found');
+  if (ownerTabId != null && entry.ownerTabId !== ownerTabId) {
+    throw new Error('regular_submission_owner_mismatch');
+  }
+  await saveRegularSubmission({ ...entry, ...changes });
+}
+
+async function resolveExistingRegularDownload(entry) {
+  let item = null;
+  if (entry.downloadId) {
+    const items = await chrome.downloads.search({ id: entry.downloadId });
+    item = Array.isArray(items) ? items[0] : null;
+  } else if (entry.downloadIntent?.filename) {
+    const intentTime = Number(entry.downloadIntent.createdAt || 0);
+    const expectedSuffix = String(entry.downloadIntent.filename).replace(/\\/g, '/').toLowerCase();
+    const extensionIndex = expectedSuffix.lastIndexOf('.');
+    const expectedStem = extensionIndex >= 0 ? expectedSuffix.slice(0, extensionIndex) : expectedSuffix;
+    const expectedExtension = extensionIndex >= 0 ? expectedSuffix.slice(extensionIndex) : '';
+    const candidates = await chrome.downloads.search({
+      startedAfter: new Date(Math.max(0, intentTime - 5000)).toISOString()
+    });
+    item = candidates.find((candidate) => {
+      const filename = String(candidate.filename || '').replace(/\\/g, '/').toLowerCase();
+      const suffixMatches = filename.endsWith(expectedSuffix)
+        || (expectedExtension && new RegExp(
+          `${expectedStem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\(\\d+\\)${expectedExtension.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`
+        ).test(filename));
+      return suffixMatches && Number(new Date(candidate.startTime || 0)) >= intentTime - 5000;
+    }) || null;
+    if (item?.id) {
+      await updateRegularSubmission(entry.submissionId, {
+        downloadId: item.id,
+        downloadStartedAt: Number(new Date(item.startTime || 0)) || intentTime
+      });
+    }
+  }
+  if (!entry.downloadId && !entry.downloadIntent) return false;
+  if (!item || item.error || item.state === 'interrupted') return false;
+  if (item.state !== 'complete') {
+    throw new Error('regular_submission_download_in_progress');
+  }
+  await completeRegularSubmission(entry.submissionId);
+  return true;
+}
+
+async function downloadReconciledRegularSubmission(entry, record) {
+  if (!record?.audioUrl || Number(record.status) !== 0) return false;
+  if (await resolveExistingRegularDownload(entry)) return true;
+  const target = await buildDownloadTarget({
+    voiceName: entry.speakerName || entry.voiceName || 'dictor',
+    scriptName: entry.scriptName || null,
+    forceIndex: entry.downloadIndex || null,
+    speakerName: entry.speakerName || null,
+    downloadLayout: entry.downloadLayout || null,
+    sourceFileName: entry.sourceFileName || null,
+    sourceFileBaseName: entry.sourceFileBaseName || null
+  });
+  const downloadIntent = { filename: target.newFilename, createdAt: Date.now() };
+  await updateRegularSubmission(entry.submissionId, { downloadIntent });
+  const downloadId = await chrome.downloads.download({
+    url: record.audioUrl,
+    filename: target.newFilename,
+    conflictAction: 'uniquify',
+    saveAs: false
+  });
+  await updateRegularSubmission(entry.submissionId, { downloadId, downloadStartedAt: Date.now() });
+  const confirmation = await waitForDownloadConfirmation(downloadId);
+  if (!confirmation.ok) throw new Error(confirmation.reason || 'reconciled_download_failed');
+  await saveToDownloadHistory(target.folderName, target.newFilename, target.fileNumber);
+  await completeRegularSubmission(entry.submissionId);
+  return true;
+}
+
+async function reconcileRegularSubmissionLedger(tabId) {
+  const unresolved = await getUnresolvedRegularSubmissions();
+  if (unresolved.length === 0) return [];
+  const response = await sendTabMessageWithTimeout(tabId, {
+    action: 'queryLongTextHistory',
+    timeout: 30000,
+    tasks: unresolved.map((entry) => ({
+      localId: entry.submissionId,
+      text: entry.text,
+      voiceId: entry.voiceId,
+      voiceName: entry.voiceName,
+      submittedAt: entry.submittedAt,
+      excludedAudioIds: Array.isArray(entry.baselineAudioIds) ? entry.baselineAudioIds : []
+    }))
+  }, 30000);
+  if (!response?.success) {
+    throw new Error(response?.reason || 'regular_submission_history_reconciliation_failed');
+  }
+  const matchedIds = new Set();
+  for (const match of response.matches || []) {
+    const entry = unresolved.find((item) => item.submissionId === match.localId);
+    if (entry && match.record) {
+      matchedIds.add(entry.submissionId);
+      await downloadReconciledRegularSubmission(entry, match.record);
+    }
+  }
+  for (const entry of unresolved) {
+    const expiredReservation = entry.phase === 'reserved'
+      && !matchedIds.has(entry.submissionId)
+      && Date.now() - Number(entry.submittedAt || 0) > 2 * 60 * 1000;
+    if (expiredReservation) await completeRegularSubmission(entry.submissionId);
+  }
+  return getUnresolvedRegularSubmissions();
+}
 
 function reserveNamedDownload(url, filename) {
   const reservation = { url, filename, createdAt: Date.now() };
@@ -17,7 +163,7 @@ function releaseNamedDownload(reservation) {
 }
 
 // Загружаем состояние при старте
-chrome.storage.local.get('extensionEnabled', (data) => {
+const extensionEnabledReady = chrome.storage.local.get('extensionEnabled').then((data) => {
   extensionEnabled = data.extensionEnabled !== false;
 });
 
@@ -95,10 +241,12 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
 function isValidAudioUrl(url) {
   try {
     const urlObj = new URL(url);
+    if (urlObj.protocol !== 'https:') return false;
     if (!urlObj.pathname.endsWith('.mp3')) return false;
 
     const validDomains = ['cdn.hailuoai.video', 'hailuoai.com', 'minimax.io'];
-    if (!validDomains.some(domain => urlObj.hostname.includes(domain))) return false;
+    const hostname = urlObj.hostname.toLowerCase();
+    if (!validDomains.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`))) return false;
 
     return true;
   } catch (error) {
@@ -235,22 +383,18 @@ let downloadHistoryLock = Promise.resolve();
 // Сохраняем в историю
 async function saveToDownloadHistory(voiceName, filename, fileNumber) {
   const save = downloadHistoryLock.then(async () => {
-    try {
-      const data = await chrome.storage.local.get('downloadHistory');
-      let history = data.downloadHistory || [];
+    const data = await chrome.storage.local.get('downloadHistory');
+    let history = data.downloadHistory || [];
 
-      history.push({
-        voiceName,
-        filename,
-        fileNumber,
-        timestamp: Date.now()
-      });
+    history.push({
+      voiceName,
+      filename,
+      fileNumber,
+      timestamp: Date.now()
+    });
 
-      if (history.length > 100) history = history.slice(-100);
-      await chrome.storage.local.set({ downloadHistory: history });
-    } catch (error) {
-      console.error('Ошибка сохранения истории:', error);
-    }
+    if (history.length > 100) history = history.slice(-100);
+    await chrome.storage.local.set({ downloadHistory: history });
   });
   downloadHistoryLock = save.catch(() => {});
   return save;
@@ -461,7 +605,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
         console.log(`Скачиваем как ${target.newFilename}`);
 
+        const submissionId = String(request.submissionId || '');
+
         const namedReservation = reserveNamedDownload(url, target.newFilename);
+        if (submissionId) {
+          await queueRegularSubmissionLedger(() => updateRegularSubmission(submissionId, {
+            downloadIntent: { filename: target.newFilename, createdAt: Date.now() }
+          }, sender.tab?.id));
+        }
         chrome.downloads.download({
           url: url,
           filename: target.newFilename,
@@ -473,13 +624,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             console.error('Ошибка скачивания:', chrome.runtime.lastError);
             sendResponse({ success: false, reason: chrome.runtime.lastError.message });
           } else {
+            if (submissionId) {
+              try {
+                await queueRegularSubmissionLedger(() => updateRegularSubmission(submissionId, {
+                  downloadId,
+                  downloadStartedAt: Date.now()
+                }, sender.tab?.id));
+              } catch (error) {
+                sendResponse({ success: false, reason: error.message, downloadId });
+                return;
+              }
+            }
             const confirmResult = await waitForDownloadConfirmation(downloadId);
             if (!confirmResult.ok) {
               sendResponse({ success: false, reason: confirmResult.reason, downloadId });
               return;
             }
 
-            saveToDownloadHistory(target.folderName, target.newFilename, target.fileNumber);
+            await saveToDownloadHistory(target.folderName, target.newFilename, target.fileNumber);
+            if (submissionId) {
+              await queueRegularSubmissionLedger(() => completeRegularSubmission(submissionId));
+            }
             sendResponse({
               success: true,
               downloadId,
@@ -513,7 +678,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
         console.log(`Скачиваем audio data как ${target.newFilename}`);
 
+        const submissionId = String(request.submissionId || '');
+
         const namedReservation = reserveNamedDownload(request.dataUrl, target.newFilename);
+        if (submissionId) {
+          await queueRegularSubmissionLedger(() => updateRegularSubmission(submissionId, {
+            downloadIntent: { filename: target.newFilename, createdAt: Date.now() }
+          }, sender.tab?.id));
+        }
         chrome.downloads.download({
           url: request.dataUrl,
           filename: target.newFilename,
@@ -525,6 +697,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             console.error('Ошибка скачивания data url:', chrome.runtime.lastError);
             sendResponse({ success: false, reason: chrome.runtime.lastError.message });
           } else {
+            if (submissionId) {
+              try {
+                await queueRegularSubmissionLedger(() => updateRegularSubmission(submissionId, {
+                  downloadId,
+                  downloadStartedAt: Date.now()
+                }, sender.tab?.id));
+              } catch (error) {
+                sendResponse({ success: false, reason: error.message, downloadId });
+                return;
+              }
+            }
             const confirmResult = await waitForDownloadConfirmation(downloadId);
             if (!confirmResult.ok) {
               sendResponse({ success: false, reason: confirmResult.reason, downloadId });
@@ -532,6 +715,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             }
 
             await saveToDownloadHistory(target.folderName, target.newFilename, target.fileNumber);
+            if (submissionId) {
+              await queueRegularSubmissionLedger(() => completeRegularSubmission(submissionId));
+            }
             sendResponse({
               success: true,
               downloadId,
@@ -736,6 +922,782 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             return { ok: true };
           },
 
+          listMyVoices: async function() {
+            var webpackRequire = null;
+            window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+            window.webpackChunk_N_E.push([['minimax-voice-list-' + Date.now()], {}, function(require) {
+              webpackRequire = require;
+            }]);
+            if (!webpackRequire?.m) return { ok: false, reason: 'minimax_api_runtime_missing' };
+
+            var moduleId = Object.keys(webpackRequire.m).find(function(id) {
+              return String(webpackRequire.m[id]).indexOf('/v1/api/audio/voice/list') >= 0;
+            });
+            if (!moduleId) return { ok: false, reason: 'minimax_voice_api_missing' };
+            var api = webpackRequire(moduleId);
+            var listVoices = Object.values(api).find(function(value) {
+              return typeof value === 'function'
+                && String(value).indexOf('/v1/api/audio/voice/list') >= 0;
+            });
+            if (!listVoices) return { ok: false, reason: 'minimax_voice_api_export_missing' };
+
+            var voices = [];
+            var page = 1;
+            var hasMore = true;
+            try {
+              while (hasMore && page <= 100) {
+                var payload = await listVoices({
+                  is_system: false,
+                  is_collect: false,
+                  page: page,
+                  page_size: 30,
+                  filter: [],
+                  user_language: document.documentElement.lang || 'en'
+                });
+                if (!payload || !Array.isArray(payload.voice_list) || typeof payload.has_more !== 'boolean') {
+                  return { ok: false, reason: 'voice_list_response_invalid' };
+                }
+                if (payload.has_more && payload.voice_list.length === 0) {
+                  return { ok: false, reason: 'voice_list_pagination_incomplete' };
+                }
+                for (var index = 0; index < payload.voice_list.length; index += 1) {
+                  var voice = payload.voice_list[index];
+                  var createTime = Number(voice?.create_time);
+                  var generateChannel = Number(voice?.generate_channel);
+                  var voiceStatus = Number(voice?.voice_status);
+                  if (!voice || typeof voice !== 'object'
+                    || !String(voice.voice_id || '').trim()
+                    || !String(voice.voice_name || '').trim()
+                    || !Number.isFinite(createTime)
+                    || !Number.isFinite(generateChannel)
+                    || !Number.isFinite(voiceStatus)) {
+                    return { ok: false, reason: 'voice_list_record_invalid' };
+                  }
+                  voices.push({
+                    voiceId: String(voice.voice_id).trim(),
+                    voiceName: String(voice.voice_name).trim(),
+                    createTime: createTime,
+                    generateChannel: generateChannel,
+                    voiceStatus: voiceStatus
+                  });
+                }
+                hasMore = payload.has_more;
+                page += 1;
+              }
+            } catch (error) {
+              return { ok: false, reason: error?.message || 'voice_list_request_failed' };
+            }
+            if (hasMore) return { ok: false, reason: 'voice_list_pagination_incomplete' };
+            return { ok: true, voices: voices };
+          },
+
+          getGenerationCredit: async function(requestedCharacters) {
+            var webpackRequire = null;
+            window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+            window.webpackChunk_N_E.push([['minimax-credit-' + Date.now()], {}, function(require) {
+              webpackRequire = require;
+            }]);
+            if (!webpackRequire?.m) return { ok: false, reason: 'minimax_api_runtime_missing' };
+
+            var creditModuleId = Object.keys(webpackRequire.m).find(function(id) {
+              return String(webpackRequire.m[id]).indexOf('/v1/api/audio/billing/credit') >= 0;
+            });
+            if (!creditModuleId) return { ok: false, reason: 'minimax_credit_api_missing' };
+            var creditModule = webpackRequire(creditModuleId);
+            var getCredit = Object.values(creditModule).find(function(value) {
+              return typeof value === 'function'
+                && String(value).indexOf('/v1/api/audio/billing/credit') >= 0;
+            });
+            if (!getCredit) return { ok: false, reason: 'minimax_credit_api_export_missing' };
+
+            try {
+              var credit = await getCredit({ scene: 1, coin_type: 0, biz_line: 1 });
+              var storeModule = webpackRequire.m['66021'] ? webpackRequire('66021') : null;
+              var state = storeModule?.store?.getState?.();
+              var selectedModelId = state?.global?.constantsMap?.selectedModel;
+              var selectedModel = state?.global?.modelOptions?.find(function(model) {
+                return model?.value === selectedModelId;
+              });
+              var totalCredit = Number(credit?.total_credit);
+              var creditRatio = Number(selectedModel?.creditRatio);
+              var characterCount = Math.max(0, Number(requestedCharacters) || 0);
+              if (!selectedModelId || !selectedModel
+                || !Number.isFinite(totalCredit)
+                || !Number.isFinite(creditRatio)
+                || creditRatio <= 0) {
+                return { ok: false, reason: 'minimax_credit_response_invalid' };
+              }
+              var requiredCredit = Math.ceil(characterCount * creditRatio);
+              return {
+                ok: true,
+                totalCredit: totalCredit,
+                creditRatio: creditRatio,
+                requiredCredit: requiredCredit,
+                affordableCharacters: Math.floor(totalCredit / creditRatio),
+                requestedCharacters: characterCount,
+                sufficient: requiredCredit <= totalCredit,
+                selectedModel: String(selectedModelId || '')
+              };
+            } catch (error) {
+              return { ok: false, reason: error?.message || 'minimax_credit_request_failed' };
+            }
+          },
+
+          getDirectTtsCapability: function() {
+            var webpackRequire = null;
+            window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+            window.webpackChunk_N_E.push([['minimax-direct-probe-' + Date.now()], {}, function(require) {
+              webpackRequire = require;
+            }]);
+            if (!webpackRequire?.m) return { ok: false, reason: 'minimax_api_runtime_missing' };
+            var managerModuleId = webpackRequire.m['78544'] ? '78544' : Object.keys(webpackRequire.m).find(function(id) {
+              return String(webpackRequire.m[id]).indexOf('/v1/api/audio/ws') >= 0;
+            });
+            if (!managerModuleId) return { ok: false, reason: 'minimax_tts_manager_missing' };
+            var managerModule = webpackRequire(managerModuleId);
+            var manager = Object.values(managerModule).find(function(value) {
+              return value && typeof value.initWebSocket === 'function'
+                && typeof value.close === 'function';
+            });
+            var storeModule = webpackRequire.m['66021'] ? webpackRequire('66021') : null;
+            var state = storeModule?.store?.getState?.();
+            var settings = state?.tts?.settings;
+            var effects = state?.voice?.effects;
+            var model = String(state?.global?.constantsMap?.selectedModel || '');
+            var voiceId = String(settings?.voice_id || '');
+            var language = String(state?.detect?.isDetecting
+              ? state?.detect?.detectedLanguage || ''
+              : settings?.language_boost || '');
+            var format = String(settings?.format || 'mp3').toLowerCase();
+            if (!manager || !state || !settings || !effects) {
+              return { ok: false, reason: 'minimax_tts_runtime_incomplete' };
+            }
+            if (!model || !voiceId) {
+              return { ok: false, reason: 'minimax_direct_settings_incomplete' };
+            }
+            if (format !== 'mp3') return { ok: false, reason: 'minimax_direct_format_unsupported' };
+            return {
+              ok: true,
+              managerModuleId: String(managerModuleId),
+              model,
+              voiceId,
+              language,
+              format
+            };
+          },
+
+          getDirectTtsReadyState: function(expectedText, expectedVoiceId, expectedLanguage) {
+            var webpackRequire = null;
+            window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+            window.webpackChunk_N_E.push([['minimax-direct-ready-' + Date.now()], {}, function(require) {
+              webpackRequire = require;
+            }]);
+            var storeModule = webpackRequire?.m?.['66021'] ? webpackRequire('66021') : null;
+            var state = storeModule?.store?.getState?.();
+            var text = String(state?.tts?.currentText || '');
+            var settings = state?.tts?.settings;
+            var language = state?.detect?.isDetecting
+              ? state?.detect?.detectedLanguage
+              : settings?.language_boost;
+            var normalizedExpectedLanguage = String(expectedLanguage || '').trim().toLowerCase();
+            var languageMatches = !normalizedExpectedLanguage
+              || (normalizedExpectedLanguage === 'auto'
+                ? state?.detect?.isDetecting === true
+                : String(language || '').trim().toLowerCase() === normalizedExpectedLanguage);
+            var languageReady = normalizedExpectedLanguage === 'auto'
+              ? state?.detect?.isDetecting === true
+              : Boolean(String(language || ''));
+            var effects = state?.voice?.effects;
+            var signature = JSON.stringify({
+              model: String(state?.global?.constantsMap?.selectedModel || ''),
+              voiceSetting: {
+                speed: settings?.speed,
+                vol: settings?.vol,
+                pitch: settings?.pitch,
+                voiceId: String(settings?.voice_id || '')
+              },
+              audioSetting: {
+                sampleRate: settings?.sample_rate,
+                bitrate: settings?.bitrate,
+                format: settings?.format,
+                channel: settings?.channel
+              },
+              effects: effects || null,
+              erWeights: Array.isArray(settings?.timber_weights) ? settings.timber_weights : [],
+              language: String(language || '')
+            });
+            return {
+              ok: Boolean(state && settings && text && text === String(expectedText || '')
+                && String(state.global?.constantsMap?.selectedModel || '')
+                && String(settings.voice_id || '')
+                && (!expectedVoiceId || String(settings.voice_id || '') === String(expectedVoiceId))
+                && languageReady
+                && languageMatches),
+              textMatches: text === String(expectedText || ''),
+              model: String(state?.global?.constantsMap?.selectedModel || ''),
+              voiceId: String(settings?.voice_id || ''),
+              language: String(language || ''),
+              languageMatches: languageMatches,
+              isDetecting: state?.detect?.isDetecting === true,
+              signature: signature
+            };
+          },
+
+          submitDirectLongText: async function(expectedText, expectedSignature, expectedVoiceId, requestedTimeout) {
+            var webpackRequire = null;
+            window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+            window.webpackChunk_N_E.push([['minimax-direct-long-' + Date.now()], {}, function(require) {
+              webpackRequire = require;
+            }]);
+            if (!webpackRequire?.m) return { ok: false, disposition: 'not_sent', reason: 'minimax_api_runtime_missing' };
+            var managerModuleId = webpackRequire.m['78544'] ? '78544' : Object.keys(webpackRequire.m).find(function(id) {
+              return String(webpackRequire.m[id]).indexOf('/v1/api/audio/ws') >= 0;
+            });
+            var managerModule = managerModuleId ? webpackRequire(managerModuleId) : null;
+            var manager = managerModule && Object.values(managerModule).find(function(value) {
+              return value && typeof value.initWebSocket === 'function'
+                && typeof value.close === 'function';
+            });
+            var storeModule = webpackRequire.m['66021'] ? webpackRequire('66021') : null;
+            var state = storeModule?.store?.getState?.();
+            var settings = state?.tts?.settings;
+            var effects = state?.voice?.effects;
+            var text = String(state?.tts?.currentText || '');
+            if (!manager || !settings || !effects || !text || text !== String(expectedText || '')) {
+              return { ok: false, disposition: 'not_sent', reason: 'minimax_direct_state_mismatch' };
+            }
+            var model = String(state.global?.constantsMap?.selectedModel || '');
+            var voiceId = String(settings.voice_id || '');
+            if (!model || !voiceId) {
+              return { ok: false, disposition: 'not_sent', reason: 'minimax_direct_settings_incomplete' };
+            }
+            if (expectedVoiceId && voiceId !== String(expectedVoiceId)) {
+              return { ok: false, disposition: 'not_sent', reason: 'minimax_direct_voice_mismatch' };
+            }
+            var language = state.detect?.isDetecting ? state.detect?.detectedLanguage : settings.language_boost;
+            var currentSignature = JSON.stringify({
+              model: model,
+              voiceSetting: { speed: settings.speed, vol: settings.vol, pitch: settings.pitch, voiceId: voiceId },
+              audioSetting: {
+                sampleRate: settings.sample_rate,
+                bitrate: settings.bitrate,
+                format: settings.format,
+                channel: settings.channel
+              },
+              effects: effects,
+              erWeights: Array.isArray(settings.timber_weights) ? settings.timber_weights : [],
+              language: String(language || '')
+            });
+            if (!expectedSignature || currentSignature !== expectedSignature) {
+              return { ok: false, disposition: 'not_sent', reason: 'minimax_direct_settings_changed' };
+            }
+            var msgId = crypto.randomUUID();
+            var wsKey = 'tts';
+            var frame = {
+              method: 'T2aAsync',
+              payload: {
+                model: model,
+                text: text,
+                voice_setting: {
+                  speed: Number(settings.speed),
+                  vol: Number(settings.vol),
+                  pitch: Number(settings.pitch),
+                  voice_id: voiceId
+                },
+                audio_setting: {
+                  sample_rate: settings.sample_rate,
+                  bitrate: settings.bitrate,
+                  format: settings.format,
+                  channel: settings.channel
+                },
+                effects: {
+                  deepen_lighten: Number(effects.deepen_lighten || 0),
+                  stronger_softer: Number(effects.stronger_softer || 0),
+                  nasal_crisp: Number(effects.nasal_crisp || 0),
+                  spacious_echo: Boolean(effects.spacious_echo),
+                  lofi_telephone: Boolean(effects.lofi_telephone),
+                  robotic: Boolean(effects.robotic),
+                  auditorium_echo: Boolean(effects.auditorium_echo)
+                },
+                er_weights: Array.isArray(settings.timber_weights) ? settings.timber_weights : [],
+                language_boost: language,
+                stream: true
+              },
+              msg_id: msgId
+            };
+            return await new Promise(function(resolve) {
+              var settled = false;
+              var opened = false;
+              var finish = function(result) {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                try { manager.close(wsKey); } catch (error) {}
+                resolve(result);
+              };
+              var timer = setTimeout(function() {
+                finish(opened
+                  ? { ok: false, disposition: 'accepted_unknown', reason: 'minimax_direct_response_timeout', msgId: msgId }
+                  : { ok: false, disposition: 'not_sent', reason: 'minimax_direct_connect_timeout' });
+              }, Math.max(1000, Number(requestedTimeout) || 15000));
+              try {
+                manager.close(wsKey);
+                manager.initWebSocket({
+                  url: '/v1/api/audio/ws',
+                  body: frame,
+                  wsKey: wsKey,
+                  onOpen: function() { opened = true; },
+                  onMessage: function(message) {
+                    if (message?.method === 'Heartbeat') return;
+                    var responseMeta = {
+                      method: String(message?.method || ''),
+                      keys: message && typeof message === 'object' ? Object.keys(message).sort() : [],
+                      statusCode: message?.statusInfo?.code ?? message?.base_resp?.status_code ?? null,
+                      dataKeys: message?.data && typeof message.data === 'object' ? Object.keys(message.data).sort() : [],
+                      dataStatus: message?.data?.status ?? null,
+                      inputSensitive: message?.input_sensitive === true
+                    };
+                    if (message?.input_sensitive) {
+                      finish({ ok: false, disposition: 'rejected', reason: 'minimax_input_sensitive', msgId: msgId, responseMeta: responseMeta });
+                      return;
+                    }
+                    var rawCode = message?.statusInfo?.code ?? message?.base_resp?.status_code;
+                    var code = rawCode == null ? null : Number(rawCode);
+                    if (code !== null && code !== 0) {
+                      var rejectionReason = String(message?.statusInfo?.message || message?.base_resp?.status_msg || 'minimax_direct_rejected');
+                      finish({
+                        ok: false,
+                        disposition: 'rejected',
+                        reason: rejectionReason,
+                        category: /credit|balance|quota|insufficient/i.test(rejectionReason)
+                          ? 'insufficient_credit'
+                          : 'server_rejected',
+                        code: code,
+                        msgId: msgId,
+                        responseMeta: responseMeta
+                      });
+                      return;
+                    }
+                    if (message?.method === 'T2aAsync' && (code === null || code === 0)) {
+                      finish({ ok: true, disposition: 'accepted', msgId: msgId, responseMeta: responseMeta });
+                    }
+                  },
+                  onError: function(error) {
+                    finish(opened
+                      ? { ok: false, disposition: 'accepted_unknown', reason: String(error?.message || 'minimax_direct_socket_error'), msgId: msgId }
+                      : { ok: false, disposition: 'not_sent', reason: String(error?.message || 'minimax_direct_socket_error') });
+                  },
+                  onClose: function() {
+                    finish(opened
+                      ? { ok: false, disposition: 'accepted_unknown', reason: 'minimax_direct_socket_closed', msgId: msgId }
+                      : { ok: false, disposition: 'not_sent', reason: 'minimax_direct_socket_closed' });
+                  }
+                });
+              } catch (error) {
+                finish({ ok: false, disposition: 'not_sent', reason: error?.message || 'minimax_direct_init_failed' });
+              }
+            });
+          },
+
+          generateDirectAudio: async function(expectedText, expectedSignature, expectedVoiceId, requestedTimeout) {
+            var webpackRequire = null;
+            window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+            window.webpackChunk_N_E.push([['minimax-direct-regular-' + Date.now()], {}, function(require) {
+              webpackRequire = require;
+            }]);
+            if (!webpackRequire?.m) return { ok: false, disposition: 'not_sent', reason: 'minimax_api_runtime_missing' };
+            var managerModuleId = webpackRequire.m['78544'] ? '78544' : Object.keys(webpackRequire.m).find(function(id) {
+              return String(webpackRequire.m[id]).indexOf('/v1/api/audio/ws') >= 0;
+            });
+            var managerModule = managerModuleId ? webpackRequire(managerModuleId) : null;
+            var manager = managerModule && Object.values(managerModule).find(function(value) {
+              return value && typeof value.initWebSocket === 'function'
+                && typeof value.close === 'function';
+            });
+            var storeModule = webpackRequire.m['66021'] ? webpackRequire('66021') : null;
+            var state = storeModule?.store?.getState?.();
+            var settings = state?.tts?.settings;
+            var effects = state?.voice?.effects;
+            var text = String(state?.tts?.currentText || '');
+            if (!manager || !settings || !effects || !text || text !== String(expectedText || '')) {
+              return { ok: false, disposition: 'not_sent', reason: 'minimax_direct_state_mismatch' };
+            }
+            var model = String(state.global?.constantsMap?.selectedModel || '');
+            var voiceId = String(settings.voice_id || '');
+            if (!model || !voiceId) {
+              return { ok: false, disposition: 'not_sent', reason: 'minimax_direct_settings_incomplete' };
+            }
+            if (expectedVoiceId && voiceId !== String(expectedVoiceId)) {
+              return { ok: false, disposition: 'not_sent', reason: 'minimax_direct_voice_mismatch' };
+            }
+            var requestedFormat = String(settings.format || 'mp3').toLowerCase();
+            if (requestedFormat !== 'mp3') {
+              return { ok: false, disposition: 'not_sent', reason: 'minimax_direct_format_unsupported' };
+            }
+            var language = state.detect?.isDetecting ? state.detect?.detectedLanguage : settings.language_boost;
+            var currentSignature = JSON.stringify({
+              model: model,
+              voiceSetting: { speed: settings.speed, vol: settings.vol, pitch: settings.pitch, voiceId: voiceId },
+              audioSetting: {
+                sampleRate: settings.sample_rate,
+                bitrate: settings.bitrate,
+                format: settings.format,
+                channel: settings.channel
+              },
+              effects: effects,
+              erWeights: Array.isArray(settings.timber_weights) ? settings.timber_weights : [],
+              language: String(language || '')
+            });
+            if (!expectedSignature || currentSignature !== expectedSignature) {
+              return { ok: false, disposition: 'not_sent', reason: 'minimax_direct_settings_changed' };
+            }
+            var msgId = crypto.randomUUID();
+            var wsKey = 'tts';
+            var frame = {
+              payload: {
+                model: model,
+                text: text,
+                voice_setting: {
+                  speed: Number(settings.speed),
+                  vol: Number(settings.vol),
+                  pitch: Number(settings.pitch),
+                  voice_id: voiceId
+                },
+                audio_setting: {
+                  sample_rate: settings.sample_rate,
+                  bitrate: settings.bitrate,
+                  format: settings.format,
+                  channel: settings.channel
+                },
+                effects: {
+                  deepen_lighten: Number(effects.deepen_lighten || 0),
+                  stronger_softer: Number(effects.stronger_softer || 0),
+                  nasal_crisp: Number(effects.nasal_crisp || 0),
+                  spacious_echo: Boolean(effects.spacious_echo),
+                  lofi_telephone: Boolean(effects.lofi_telephone),
+                  robotic: Boolean(effects.robotic),
+                  auditorium_echo: Boolean(effects.auditorium_echo)
+                },
+                er_weights: Array.isArray(settings.timber_weights) ? settings.timber_weights : [],
+                language_boost: language,
+                stream: true
+              },
+              msg_id: msgId
+            };
+            return await new Promise(function(resolve) {
+              var settled = false;
+              var opened = false;
+              var audioHex = '';
+              var finish = function(result) {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                try { manager.close(wsKey); } catch (error) {}
+                resolve(result);
+              };
+              var timer = setTimeout(function() {
+                finish(opened
+                  ? { ok: false, disposition: 'accepted_unknown', reason: 'minimax_direct_generation_timeout', msgId: msgId }
+                  : { ok: false, disposition: 'not_sent', reason: 'minimax_direct_connect_timeout' });
+              }, Math.max(1000, Number(requestedTimeout) || 180000));
+              try {
+                manager.close(wsKey);
+                manager.initWebSocket({
+                  url: '/v1/api/audio/ws',
+                  body: frame,
+                  wsKey: wsKey,
+                  onOpen: function() { opened = true; },
+                  onMessage: function(message) {
+                    if (message?.method === 'Heartbeat') return;
+                    var responseMeta = {
+                      method: String(message?.method || ''),
+                      keys: message && typeof message === 'object' ? Object.keys(message).sort() : [],
+                      statusCode: message?.statusInfo?.code ?? message?.base_resp?.status_code ?? null,
+                      dataKeys: message?.data && typeof message.data === 'object' ? Object.keys(message.data).sort() : [],
+                      dataStatus: message?.data?.status ?? null,
+                      inputSensitive: message?.input_sensitive === true
+                    };
+                    if (message?.input_sensitive) {
+                      finish({ ok: false, disposition: 'rejected', reason: 'minimax_input_sensitive', msgId: msgId, responseMeta: responseMeta });
+                      return;
+                    }
+                    var rawCode = message?.statusInfo?.code ?? message?.base_resp?.status_code;
+                    var code = rawCode == null ? null : Number(rawCode);
+                    if (code !== null && code !== 0) {
+                      finish({
+                        ok: false,
+                        disposition: 'rejected',
+                        reason: String(message?.statusInfo?.message || message?.base_resp?.status_msg || 'minimax_direct_rejected'),
+                        code: code,
+                        msgId: msgId,
+                        responseMeta: responseMeta
+                      });
+                      return;
+                    }
+                    var status = Number(message?.data?.status);
+                    if (!message?.data || (status !== 1 && status !== 2)) return;
+                    if (typeof message.data.audio === 'string') {
+                      audioHex += message.data.audio;
+                    }
+                    if (status !== 2) return;
+                    if (!audioHex || audioHex.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(audioHex)) {
+                      finish({ ok: false, disposition: 'accepted_unknown', reason: 'minimax_direct_audio_invalid', msgId: msgId, responseMeta: responseMeta });
+                      return;
+                    }
+                    var bytes = new Uint8Array(audioHex.length / 2);
+                    for (var index = 0; index < bytes.length; index += 1) {
+                      bytes[index] = parseInt(audioHex.slice(index * 2, index * 2 + 2), 16);
+                    }
+                    var audioOffset = 0;
+                    if (bytes.length >= 10 && bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) {
+                      var id3Size = ((bytes[6] & 0x7f) << 21)
+                        | ((bytes[7] & 0x7f) << 14)
+                        | ((bytes[8] & 0x7f) << 7)
+                        | (bytes[9] & 0x7f);
+                      audioOffset = 10 + id3Size;
+                    }
+                    var hasMpegFrame = audioOffset + 1 < bytes.length
+                      && bytes[audioOffset] === 0xff
+                      && (bytes[audioOffset + 1] & 0xe0) === 0xe0;
+                    if (bytes.length < 1024 || !hasMpegFrame) {
+                      finish({ ok: false, disposition: 'accepted_unknown', reason: 'minimax_direct_mp3_invalid', msgId: msgId, responseMeta: responseMeta });
+                      return;
+                    }
+                    var chunks = [];
+                    for (var offset = 0; offset < bytes.length; offset += 0x8000) {
+                      chunks.push(String.fromCharCode.apply(null, bytes.subarray(offset, offset + 0x8000)));
+                    }
+                    finish({
+                      ok: true,
+                      disposition: 'completed',
+                      msgId: msgId,
+                      size: bytes.length,
+                      responseMeta: responseMeta,
+                      dataUrl: 'data:audio/mpeg;base64,' + btoa(chunks.join(''))
+                    });
+                  },
+                  onError: function(error) {
+                    finish(opened
+                      ? { ok: false, disposition: 'accepted_unknown', reason: String(error?.message || 'minimax_direct_socket_error'), msgId: msgId }
+                      : { ok: false, disposition: 'not_sent', reason: String(error?.message || 'minimax_direct_socket_error') });
+                  },
+                  onClose: function() {
+                    finish(opened
+                      ? { ok: false, disposition: 'accepted_unknown', reason: 'minimax_direct_socket_closed', msgId: msgId }
+                      : { ok: false, disposition: 'not_sent', reason: 'minimax_direct_socket_closed' });
+                  }
+                });
+              } catch (error) {
+                finish({ ok: false, disposition: 'not_sent', reason: error?.message || 'minimax_direct_init_failed' });
+              }
+            });
+          },
+
+          getVoiceCleanupPreview: async function(protectedVoiceNames, requestedCount, protectedVoiceIds) {
+            var webpackRequire = null;
+            window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+            window.webpackChunk_N_E.push([['minimax-voice-cleanup-' + Date.now()], {}, function(require) {
+              webpackRequire = require;
+            }]);
+            if (!webpackRequire?.m) return { ok: false, reason: 'minimax_api_runtime_missing' };
+
+            var moduleId = Object.keys(webpackRequire.m).find(function(id) {
+              var source = String(webpackRequire.m[id]);
+              return source.indexOf('/v1/api/audio/voice/list') >= 0
+                && source.indexOf('/v1/api/audio/voice/equity') >= 0;
+            });
+            if (!moduleId) return { ok: false, reason: 'minimax_voice_api_missing' };
+            var api = webpackRequire(moduleId);
+            var findApi = function(path) {
+              return Object.values(api).find(function(value) {
+                return typeof value === 'function' && String(value).indexOf(path) >= 0;
+              });
+            };
+            var listVoices = findApi('/v1/api/audio/voice/list');
+            var getEquity = findApi('/v1/api/audio/voice/equity');
+            if (!listVoices || !getEquity) return { ok: false, reason: 'minimax_voice_api_export_missing' };
+
+            var normalize = function(value) {
+              return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            };
+            var protectedNames = new Set((Array.isArray(protectedVoiceNames) ? protectedVoiceNames : [])
+              .map(normalize).filter(Boolean));
+            var protectedIds = new Set((Array.isArray(protectedVoiceIds) ? protectedVoiceIds : [])
+              .map(function(value) { return String(value || '').trim(); }).filter(Boolean));
+            var voices = [];
+            var page = 1;
+            var hasMore = true;
+            while (hasMore && page <= 100) {
+              var payload = await listVoices({
+                is_system: false,
+                is_collect: false,
+                page: page,
+                page_size: 30,
+                filter: [],
+                user_language: document.documentElement.lang || 'en'
+              });
+              var items = Array.isArray(payload?.voice_list) ? payload.voice_list : [];
+              voices.push.apply(voices, items);
+              hasMore = Boolean(payload?.has_more);
+              if (items.length === 0) break;
+              page += 1;
+            }
+            if (hasMore) return { ok: false, reason: 'voice_list_too_large' };
+
+            var count = Math.min(20, Math.max(1, Number(requestedCount) || 20));
+            var eligible = voices.filter(function(voice) {
+              return String(voice.voice_id || '').trim()
+                && Number(voice.create_time) > 0
+                && Number(voice.generate_channel) === 1
+                && Number(voice.voice_status) === 2
+                && !protectedIds.has(String(voice.voice_id || '').trim())
+                && !protectedNames.has(normalize(voice.voice_name));
+            }).sort(function(left, right) {
+              return Number(left.create_time || 0) - Number(right.create_time || 0);
+            });
+            var candidates = eligible.slice(0, count).map(function(voice) {
+              return {
+                voiceId: String(voice.voice_id || ''),
+                voiceName: String(voice.voice_name || ''),
+                createTime: Number(voice.create_time || 0),
+                generateChannel: Number(voice.generate_channel),
+                voiceStatus: Number(voice.voice_status)
+              };
+            });
+            var equity = await getEquity({});
+            if (!Number.isFinite(Number(equity?.used)) || !Number.isFinite(Number(equity?.total))) {
+              return { ok: false, reason: 'voice_equity_invalid' };
+            }
+            return {
+              ok: true,
+              candidates: candidates,
+              protectedCount: voices.length - eligible.length,
+              equity: {
+                used: Number(equity?.used || 0),
+                total: Number(equity?.total || 0)
+              }
+            };
+          },
+
+          deleteVoiceCleanupCandidates: async function(candidates, protectedVoiceNames, protectedVoiceIds) {
+            var expected = Array.isArray(candidates) ? candidates.slice(0, 20) : [];
+            if (expected.length === 0) return { ok: false, reason: 'voice_cleanup_candidates_missing' };
+            var webpackRequire = null;
+            window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+            window.webpackChunk_N_E.push([['minimax-voice-delete-' + Date.now()], {}, function(require) {
+              webpackRequire = require;
+            }]);
+            var moduleId = Object.keys(webpackRequire?.m || {}).find(function(id) {
+              var source = String(webpackRequire.m[id]);
+              return source.indexOf('/v1/api/audio/voice/list') >= 0
+                && source.indexOf('/v1/api/audio/voice/delete') >= 0;
+            });
+            if (!moduleId) return { ok: false, reason: 'minimax_voice_delete_api_missing' };
+            var api = webpackRequire(moduleId);
+            var listVoices = Object.values(api).find(function(value) {
+              return typeof value === 'function'
+                && String(value).indexOf('/v1/api/audio/voice/list') >= 0;
+            });
+            var deleteVoice = Object.values(api).find(function(value) {
+              return typeof value === 'function'
+                && String(value).indexOf('/v1/api/audio/voice/delete') >= 0;
+            });
+            var getEquity = Object.values(api).find(function(value) {
+              return typeof value === 'function'
+                && String(value).indexOf('/v1/api/audio/voice/equity') >= 0;
+            });
+            if (!listVoices || !deleteVoice || !getEquity) {
+              return { ok: false, reason: 'minimax_voice_delete_export_missing' };
+            }
+
+            var normalize = function(value) {
+              return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            };
+            var protectedNames = new Set((Array.isArray(protectedVoiceNames) ? protectedVoiceNames : [])
+              .map(normalize).filter(Boolean));
+            var protectedIds = new Set((Array.isArray(protectedVoiceIds) ? protectedVoiceIds : [])
+              .map(function(value) { return String(value || '').trim(); }).filter(Boolean));
+            var voices = [];
+            var page = 1;
+            var hasMore = true;
+            while (hasMore && page <= 100) {
+              var payload = await listVoices({
+                is_system: false,
+                is_collect: false,
+                page: page,
+                page_size: 30,
+                filter: [],
+                user_language: document.documentElement.lang || 'en'
+              });
+              var items = Array.isArray(payload?.voice_list) ? payload.voice_list : [];
+              voices.push.apply(voices, items);
+              hasMore = Boolean(payload?.has_more);
+              if (items.length === 0) break;
+              page += 1;
+            }
+            if (hasMore) return { ok: false, reason: 'voice_list_too_large' };
+            var currentCandidates = voices.filter(function(voice) {
+              return String(voice.voice_id || '').trim()
+                && Number(voice.create_time) > 0
+                && Number(voice.generate_channel) === 1
+                && Number(voice.voice_status) === 2
+                && !protectedIds.has(String(voice.voice_id || '').trim())
+                && !protectedNames.has(normalize(voice.voice_name));
+            }).sort(function(left, right) {
+              return Number(left.create_time || 0) - Number(right.create_time || 0);
+            }).slice(0, expected.length);
+            var unchanged = expected.every(function(candidate, index) {
+              var current = currentCandidates[index];
+              return current
+                && String(current.voice_id) === String(candidate.voiceId)
+                && Number(current.create_time) === Number(candidate.createTime);
+            });
+            if (!unchanged) return { ok: false, reason: 'voice_cleanup_preview_changed' };
+
+            var deleted = [];
+            var failed = null;
+            for (var index = 0; index < expected.length; index += 1) {
+              var candidate = expected[index];
+              try {
+                var deleteResult = await deleteVoice({ voice_id: candidate.voiceId });
+                if (deleteResult === null || deleteResult === undefined) {
+                  throw new Error('voice_delete_response_missing');
+                }
+                if (deleteResult?.statusInfo && Number(deleteResult.statusInfo.code) !== 0) {
+                  throw new Error(deleteResult.statusInfo.message || 'voice_delete_rejected');
+                }
+                deleted.push(candidate);
+              } catch (error) {
+                failed = { candidate: candidate, reason: error?.message || 'voice_delete_failed' };
+                break;
+              }
+            }
+            var equity = null;
+            try {
+              equity = await getEquity({});
+              if (!Number.isFinite(Number(equity?.used)) || !Number.isFinite(Number(equity?.total))) {
+                throw new Error('voice_equity_invalid');
+              }
+            } catch (error) {
+              return {
+                ok: false,
+                reason: 'voice_equity_refresh_failed',
+                deleted: deleted,
+                failed: failed
+              };
+            }
+            return {
+              ok: !failed,
+              reason: failed?.reason || '',
+              deleted: deleted,
+              failed: failed?.candidate || null,
+              equity: {
+                used: Number(equity?.used || 0),
+                total: Number(equity?.total || 0)
+              }
+            };
+          },
+
           ensureLongTextHistoryCapture: function() {
             if (window.__minimaxLongTextHistoryCapture?.installed) {
               return { ok: true, alreadyInstalled: true };
@@ -784,26 +1746,100 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           },
 
           consumeLongTextHistory: async function(tasks, timeout) {
-            var capture = window.__minimaxLongTextHistoryCapture;
-            if (!capture?.installed) return { ok: false, reason: 'history_capture_not_installed' };
-            var startedAt = Date.now();
-            var maxWait = Number(timeout) || 10000;
+            var requestedTasks = Array.isArray(tasks) ? tasks : [];
+            var webpackRequire = null;
+            var chunkName = 'minimax-history-' + Date.now();
+            window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+            window.webpackChunk_N_E.push([[chunkName], {}, function(require) {
+              webpackRequire = require;
+            }]);
+            if (!webpackRequire?.m) return { ok: false, reason: 'minimax_api_runtime_missing' };
 
-            while (!capture.snapshot && Date.now() - startedAt < maxWait) {
-              await new Promise(function(resolve) { setTimeout(resolve, 200); });
+            var apiModuleId = Object.keys(webpackRequire.m).find(function(moduleId) {
+              return String(webpackRequire.m[moduleId]).indexOf('/v1/api/audio/history_list') >= 0;
+            });
+            if (!apiModuleId) return { ok: false, reason: 'minimax_history_api_missing' };
+
+            var apiModule = webpackRequire(apiModuleId);
+            var fetchHistoryPage = Object.values(apiModule).find(function(value) {
+              return typeof value === 'function'
+                && String(value).indexOf('/v1/api/audio/history_list') >= 0;
+            });
+            if (!fetchHistoryPage) return { ok: false, reason: 'minimax_history_api_export_missing' };
+
+            var list = [];
+            var page = 1;
+            var pageSize = 50;
+            var maxPages = 100;
+            var hasMore = true;
+            var pagesFetched = 0;
+            var stoppedAfterMatch = false;
+            var deadline = Date.now() + (Number(timeout) || 10000);
+            var targetAudioIds = new Set(requestedTasks.map(function(task) {
+              return String(task.audioId || '');
+            }).filter(Boolean));
+            var hasTextTargets = requestedTasks.some(function(task) {
+              return !task.audioId && !!task.text;
+            });
+            var earliestSubmission = requestedTasks.reduce(function(earliest, task) {
+              if (task.audioId || !task.submittedAt) return earliest;
+              var submittedAt = Number(task.submittedAt);
+              return !earliest || submittedAt < earliest ? submittedAt : earliest;
+            }, 0);
+
+            try {
+              while (hasMore && page <= maxPages) {
+                var remainingMs = deadline - Date.now();
+                if (remainingMs <= 0) return { ok: false, reason: 'history_api_timeout' };
+                var payload = await Promise.race([
+                  fetchHistoryPage({ page: page, page_size: pageSize }),
+                  new Promise(function(resolve) {
+                    setTimeout(function() {
+                      resolve({ __historyTimeout: true });
+                    }, remainingMs);
+                  })
+                ]);
+                if (payload?.__historyTimeout) return { ok: false, reason: 'history_api_timeout' };
+                var pageItems = payload?.audio_list;
+                if (!Array.isArray(pageItems)) return { ok: false, reason: 'history_list_missing' };
+                list.push.apply(list, pageItems);
+                pagesFetched += 1;
+
+                pageItems.forEach(function(item) {
+                  targetAudioIds.delete(String(item.audio_id || ''));
+                });
+                var oldestUpdateTime = pageItems.reduce(function(oldest, item) {
+                  var updateTime = Number(item.update_time || 0);
+                  return !oldest || updateTime < oldest ? updateTime : oldest;
+                }, 0);
+                var reachedSubmissionWindow = earliestSubmission
+                  && oldestUpdateTime
+                  && oldestUpdateTime < earliestSubmission - 10000;
+                var knownIdsFound = targetAudioIds.size === 0;
+
+                hasMore = Boolean(payload?.has_more);
+                if (pageItems.length === 0) break;
+                if (knownIdsFound
+                  && (!hasTextTargets || reachedSubmissionWindow)) {
+                  stoppedAfterMatch = true;
+                  break;
+                }
+                page += 1;
+              }
+            } catch (error) {
+              return { ok: false, reason: error?.message || 'history_api_request_failed' };
             }
-            if (!capture.snapshot) return { ok: false, reason: 'history_response_timeout' };
-
-            var list = capture.snapshot?.data?.audio_list;
-            if (!Array.isArray(list)) return { ok: false, reason: 'history_list_missing' };
+            if (hasMore && !stoppedAfterMatch) {
+              return { ok: false, reason: 'history_pagination_incomplete' };
+            }
 
             var claimedIds = new Set();
-            (Array.isArray(tasks) ? tasks : []).forEach(function(task) {
+            requestedTasks.forEach(function(task) {
               (Array.isArray(task.excludedAudioIds) ? task.excludedAudioIds : []).forEach(function(id) {
                 claimedIds.add(String(id));
               });
             });
-            var matches = (Array.isArray(tasks) ? tasks : []).map(function(task) {
+            var matches = requestedTasks.map(function(task) {
               var candidates = list.filter(function(item) {
                 if (task.audioId) return String(item.audio_id || '') === String(task.audioId);
                 if (!task.text) return false;
@@ -812,10 +1848,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 var taskText = String(task.text || '').replace(/\s+/g, ' ').trim();
                 return itemText === taskText && !claimedIds.has(audioId);
               });
-              if (!task.audioId && task.voiceId) {
+              if (!task.audioId && task.voiceName) {
                 candidates = candidates.filter(function(item) {
                   var actual = String(item.voice_name || '').trim().toLowerCase();
-                  var expected = String(task.voiceId || '').trim().toLowerCase();
+                  var expected = String(task.voiceName || '').trim().toLowerCase();
                   actual = actual.replace(/\s+/g, ' ');
                   expected = expected.replace(/\s+/g, ' ');
                   if (!expected) return true;
@@ -830,10 +1866,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 return Math.abs(Number(a.update_time || 0) - Number(task.submittedAt))
                   - Math.abs(Number(b.update_time || 0) - Number(task.submittedAt));
               });
-              var record = candidates.find(function(item) {
+              candidates = candidates.filter(function(item) {
                 if (task.audioId || !task.submittedAt) return true;
-                return Number(item.update_time || 0) >= Number(task.submittedAt) - 10000;
-              }) || null;
+                return Number(item.update_time || 0) >= Number(task.submittedAt);
+              });
+              if (!task.audioId && candidates.length > 1) {
+                return {
+                  localId: task.localId,
+                  record: null,
+                  ambiguous: true,
+                  candidateAudioIds: candidates.map(function(item) { return String(item.audio_id || ''); })
+                };
+              }
+              var record = candidates[0] || null;
               if (!record) return { localId: task.localId, record: null };
               claimedIds.add(String(record.audio_id || ''));
               return {
@@ -854,7 +1899,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               ok: true,
               matches: matches,
               audioIds: list.map(function(item) { return String(item.audio_id || ''); }).filter(Boolean),
-              capturedAt: capture.capturedAt
+              capturedAt: Date.now(),
+              pagesFetched: pagesFetched,
+              historyComplete: !hasMore
             };
           },
 
@@ -864,7 +1911,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             var startedAt = Date.now();
             var maxWait = Number(timeout) || 60000;
             var taskText = String(task?.text || '').replace(/\s+/g, ' ').trim();
-            var expectedVoice = String(task?.voiceId || '').trim().toLowerCase().replace(/\s+/g, ' ');
+            var expectedVoice = String(task?.voiceName || task?.voiceId || '').trim().toLowerCase().replace(/\s+/g, ' ');
             var submittedAt = Number(task?.submittedAt || 0);
 
             while (Date.now() - startedAt < maxWait) {
@@ -1244,6 +2291,7 @@ function getDefaultLongTextState() {
 }
 
 let longTextState = getDefaultLongTextState();
+let longTextStopRequested = false;
 
 async function loadLongTextState() {
   const data = await chrome.storage.local.get('longTextState');
@@ -1254,7 +2302,7 @@ async function loadLongTextState() {
 async function saveLongTextState() {
   longTextState.updatedAt = Date.now();
   const activeTasks = longTextState.tasks.filter((task) => {
-    return ['queued', 'submitting', 'awaiting_match', 'pending', 'ready', 'downloading'].includes(task.status);
+    return ['queued', 'submitting', 'awaiting_match', 'pending', 'ready', 'downloading', 'reconciliation_required'].includes(task.status);
   });
   const finishedTasks = longTextState.tasks.filter((task) => !activeTasks.includes(task)).slice(-100);
   longTextState.tasks = [...finishedTasks, ...activeTasks];
@@ -1270,9 +2318,141 @@ function getLongTextSummary() {
     pending: count(['awaiting_match', 'pending']),
     ready: count(['ready', 'downloading']),
     completed: count(['completed']),
-    failed: count(['error']),
+    failed: count(['error', 'reconciliation_required']),
     isSubmitting: longTextState.isSubmitting === true,
-    hasActive: count(['queued', 'submitting', 'awaiting_match', 'pending', 'ready', 'downloading']) > 0
+    hasPollable: count(['queued', 'submitting', 'awaiting_match', 'pending', 'ready', 'downloading']) > 0,
+    hasActive: count(['queued', 'submitting', 'awaiting_match', 'pending', 'ready', 'downloading', 'reconciliation_required']) > 0
+  };
+}
+
+async function getSubmissionRecoverySummary() {
+  const [regularSubmissions] = await Promise.all([
+    getUnresolvedRegularSubmissions(),
+    loadLongTextState()
+  ]);
+  const unresolvedLongText = longTextState.tasks.filter((task) => (
+    ['queued', 'submitting', 'awaiting_match', 'pending', 'reconciliation_required'].includes(task.status)
+  ));
+  return {
+    regular: regularSubmissions.length,
+    longText: unresolvedLongText.length,
+    total: regularSubmissions.length + unresolvedLongText.length
+  };
+}
+
+async function confirmAutomationStopped(tabId, matchesRuntime) {
+  if (!tabId) return true;
+  try {
+    await chrome.tabs.get(tabId);
+  } catch (error) {
+    return true;
+  }
+
+  let runtime;
+  try {
+    runtime = await sendTabMessageWithTimeout(tabId, { action: 'getAutomationRuntimeState' }, 7000);
+  } catch (error) {
+    throw new Error('automation_runtime_unconfirmed');
+  }
+  if (!runtime?.success) throw new Error('automation_runtime_unconfirmed');
+  if (runtime.state?.isRunning && matchesRuntime(runtime.state)) {
+    throw new Error('automation_runtime_active');
+  }
+  if (runtime.state?.isRunning) throw new Error('another_automation_runtime_active');
+  return true;
+}
+
+async function resolveSubmissionRecovery(tabId) {
+  await Promise.all([loadBatchState(), loadParallelBatchState(), loadLongTextState()]);
+  if (longTextState.isSubmitting
+    || (batchState.isRunning && !batchState.activeJob)
+    || (parallelBatchState.isRunning && !parallelBatchState.runId)) {
+    throw new Error('automation_running');
+  }
+  if (batchState.activeJob && batchState.activeTabId) {
+    await confirmAutomationStopped(batchState.activeTabId, (runtime) => (
+      runtime.legacyJobId === batchState.activeJob.legacyJobId
+    ));
+  }
+  if (parallelBatchState.runId) {
+    for (const worker of parallelBatchState.workers || []) {
+      await confirmAutomationStopped(worker.tabId, (runtime) => (
+        runtime.runId === parallelBatchState.runId && runtime.workerId === worker.workerId
+      ));
+    }
+  }
+
+  batchState.isRunning = false;
+  parallelBatchState.isRunning = false;
+  await Promise.all([saveBatchState(), saveParallelBatchState()]);
+
+  const recoverySummary = await getSubmissionRecoverySummary();
+  if (recoverySummary.total > 0 && !tabId) {
+    throw new Error('minimax_tab_required_for_history_reconciliation');
+  }
+  if (recoverySummary.total > 0) {
+    await chrome.tabs.get(tabId);
+    await reconcileRegularSubmissionLedger(tabId);
+    const unresolvedLongText = longTextState.tasks.filter((task) => (
+      ['queued', 'submitting', 'awaiting_match', 'pending', 'reconciliation_required'].includes(task.status)
+    ));
+    const claimedAudioIds = longTextState.tasks.map((task) => task.audioId).filter(Boolean);
+    const historyResponse = await sendTabMessageWithTimeout(tabId, {
+      action: 'queryLongTextHistory',
+      timeout: 30000,
+      tasks: unresolvedLongText.map((task) => ({
+        localId: task.localId,
+        audioId: task.audioId,
+        text: task.text,
+        voiceId: task.voiceId,
+        voiceName: task.selectedVoiceName,
+        submittedAt: task.submittedAt,
+        excludedAudioIds: [...(longTextState.baselineAudioIds || []), ...claimedAudioIds]
+      }))
+    }, 30000);
+    if (!historyResponse?.success) {
+      throw new Error(historyResponse?.reason || 'long_text_history_reconciliation_failed');
+    }
+    for (const match of historyResponse.matches || []) {
+      const task = longTextState.tasks.find((item) => item.localId === match.localId);
+      if (task && match.record) applyLongTextHistoryRecord(task, match.record);
+    }
+    await saveLongTextState();
+  }
+
+  const regularSubmissions = await getUnresolvedRegularSubmissions();
+  await chrome.storage.local.set({ [REGULAR_SUBMISSION_LEDGER_KEY]: [] });
+
+  let abandonedLongText = 0;
+  for (const task of longTextState.tasks) {
+    if (!['queued', 'submitting', 'awaiting_match', 'pending', 'reconciliation_required'].includes(task.status)) continue;
+    task.status = 'error';
+    task.submissionPhase = 'manually_abandoned';
+    task.error = 'Manually cleared after History review; automatic retry is disabled';
+    abandonedLongText += 1;
+  }
+  await saveLongTextState();
+  await stopLongTextAlarmIfIdle();
+  broadcastLongTextProgress();
+
+  if (batchState.recoveryRequired) {
+    batchState.activeJob = null;
+    batchState.recoveryRequired = false;
+    batchState.error = null;
+    batchState.isRunning = false;
+    await saveBatchState();
+  }
+  if (!parallelBatchState.isRunning && parallelBatchState.runId) {
+    const secondaryTabId = parallelBatchState.secondaryTabId;
+    parallelBatchState = getDefaultParallelBatchState();
+    await saveParallelBatchState();
+    await closeTabSafely(secondaryTabId);
+  }
+
+  return {
+    success: true,
+    clearedRegular: regularSubmissions.length,
+    clearedLongText: abandonedLongText
   };
 }
 
@@ -1303,6 +2483,17 @@ function partitionLongTextJobs(jobs) {
   return { longTextEntries, regularJobs };
 }
 
+function assertLongTextLimits(jobs) {
+  for (const job of Array.isArray(jobs) ? jobs : []) {
+    for (const entry of Array.isArray(job.queue) ? job.queue : []) {
+      const length = String(entry.text || '').length;
+      if (length > 200000) {
+        throw new Error(`Long Text exceeds the 200000 character limit (${length})`);
+      }
+    }
+  }
+}
+
 function createLongTextTask(entry) {
   return {
     localId: `long-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
@@ -1313,9 +2504,13 @@ function createLongTextTask(entry) {
     audioUrl: null,
     serverStatus: null,
     submittedAt: null,
+    submissionPhase: null,
+    reservedAt: null,
+    dispatchedAt: null,
     completedAt: null,
     error: null,
     voiceId: entry.voiceId || null,
+    selectedVoiceName: entry.voiceName || null,
     voiceName: entry.originalTag || entry.speaker || 'dictor',
     speakerName: entry.speaker || null,
     language: entry.language || 'Auto',
@@ -1353,7 +2548,7 @@ function applyLongTextHistoryRecord(task, record) {
 
 async function ensureLongTextAlarm() {
   const summary = getLongTextSummary();
-  if (!summary.hasActive || longTextState.isSubmitting) return;
+  if (!summary.hasPollable || longTextState.isSubmitting) return;
   await chrome.alarms.create(LONG_TEXT_ALARM, { delayInMinutes: 1, periodInMinutes: 1 });
 }
 
@@ -1366,8 +2561,11 @@ async function initializeLongTextState() {
     longTextState.isSubmitting = false;
     longTextState.tasks.forEach((task) => {
       if (task.status !== 'queued' && task.status !== 'submitting') return;
-      if (task.status === 'submitting' && task.submittedAt) {
+      const wasDispatched = task.submissionPhase === 'dispatched'
+        || (task.submissionPhase == null && task.submissionStartedAt);
+      if (task.status === 'submitting' && wasDispatched) {
         task.status = 'awaiting_match';
+        task.submittedAt = task.dispatchedAt || task.submissionStartedAt;
         task.error = null;
         return;
       }
@@ -1380,34 +2578,60 @@ async function initializeLongTextState() {
 }
 
 async function stopLongTextAlarmIfIdle() {
-  if (getLongTextSummary().hasActive) return;
+  if (getLongTextSummary().hasPollable) return;
   await chrome.alarms.clear(LONG_TEXT_ALARM);
 }
 
 async function submitLongTextEntries(entries, tabId) {
   if (!Array.isArray(entries) || entries.length === 0) return { submitted: 0, failed: 0 };
 
+  const cancellationReset = await sendTabMessageWithTimeout(
+    tabId,
+    { action: 'resetLongTextCancellation' },
+    7000
+  );
+  if (!cancellationReset?.success) throw new Error('long_text_cancellation_reset_failed');
+
   const baselineResponse = await sendTabMessageWithTimeout(tabId, {
     action: 'queryLongTextHistory',
+    timeout: 30000,
     tasks: []
   }, 30000);
-  if (!baselineResponse?.success) {
+  if (!baselineResponse?.success || !Array.isArray(baselineResponse.audioIds)) {
     throw new Error(baselineResponse?.reason || 'long_text_history_preflight_failed');
   }
+  const baselineAudioIds = baselineResponse.audioIds;
 
   const tasks = entries.map(createLongTextTask);
   longTextState.tasks = tasks;
-  longTextState.baselineAudioIds = Array.isArray(baselineResponse.audioIds) ? baselineResponse.audioIds : [];
+  longTextState.baselineAudioIds = baselineAudioIds;
   longTextState.monitorTabId = tabId;
   longTextState.isSubmitting = true;
   await saveLongTextState();
   broadcastLongTextProgress();
 
   let restoreError = null;
+  let reconciliationRequired = false;
+  let terminalFailure = null;
   try {
     for (const task of tasks) {
+      if (longTextStopRequested) {
+        terminalFailure = 'Long Text submission stopped before the next task';
+        for (const queuedTask of tasks.filter((item) => item.status === 'queued')) {
+          queuedTask.status = 'error';
+          queuedTask.error = 'Not submitted because Stop was requested';
+        }
+        await saveLongTextState();
+        broadcastLongTextProgress();
+        break;
+      }
       task.status = 'submitting';
-      task.submittedAt = Date.now();
+      task.intentCreatedAt = Date.now();
+      task.submittedAt = null;
+      task.submissionStartedAt = null;
+      task.submissionPhase = null;
+      task.reservedAt = null;
+      task.dispatchedAt = null;
       await saveLongTextState();
       broadcastLongTextProgress();
 
@@ -1418,12 +2642,21 @@ async function submitLongTextEntries(entries, tabId) {
             localId: task.localId,
             text: task.text,
             voiceId: task.voiceId,
+            voiceName: task.selectedVoiceName,
             language: task.language
           }
         }, 120000);
         if (!response?.success) {
-          task.status = 'error';
-          task.error = response?.reason || 'long_text_submit_failed';
+          if (task.submissionPhase === 'dispatched') {
+            task.status = 'awaiting_match';
+            task.submittedAt = task.dispatchedAt || task.submittedAt || Date.now();
+            task.error = response?.reason || 'Long Text dispatch requires History reconciliation';
+            reconciliationRequired = true;
+          } else {
+            task.status = 'error';
+            task.error = response?.reason || 'long_text_submit_failed';
+            if (task.submissionPhase === 'rejected') terminalFailure = task.error;
+          }
         } else {
           task.submittedAt = response.submittedAt || Date.now();
           task.status = 'awaiting_match';
@@ -1436,10 +2669,12 @@ async function submitLongTextEntries(entries, tabId) {
               .sort((a, b) => Number(a.submittedAt || 0) - Number(b.submittedAt || 0));
             const historyResponse = await sendTabMessageWithTimeout(tabId, {
               action: 'queryLongTextHistory',
+              timeout: 30000,
               tasks: unmatchedTasks.map((item) => ({
                 localId: item.localId,
                 text: item.text,
                 voiceId: item.voiceId,
+                voiceName: item.selectedVoiceName,
                 submittedAt: item.submittedAt,
                 excludedAudioIds: [...(longTextState.baselineAudioIds || []), ...claimedAudioIds]
               }))
@@ -1455,12 +2690,32 @@ async function submitLongTextEntries(entries, tabId) {
           }
         }
       } catch (error) {
-        task.status = 'awaiting_match';
+        const wasDispatched = task.submissionPhase === 'dispatched'
+          || (task.submissionPhase == null && task.submissionStartedAt);
+        task.status = wasDispatched ? 'awaiting_match' : 'error';
         task.error = error.message;
+        reconciliationRequired = wasDispatched;
+        if (task.submissionPhase === 'rejected') terminalFailure = task.error;
       }
 
       await saveLongTextState();
       broadcastLongTextProgress();
+      if (longTextStopRequested && !reconciliationRequired && !terminalFailure) {
+        terminalFailure = 'Long Text submission stopped before the next task';
+      }
+      if (reconciliationRequired || terminalFailure) {
+        for (const queuedTask of tasks.filter((item) => item.status === 'queued')) {
+          queuedTask.status = 'error';
+          queuedTask.error = reconciliationRequired
+            ? 'Not submitted because an earlier Long Text task requires reconciliation'
+            : longTextStopRequested
+              ? 'Not submitted because Stop was requested'
+              : 'Not submitted because an earlier Long Text task was rejected';
+        }
+        await saveLongTextState();
+        broadcastLongTextProgress();
+        break;
+      }
     }
   } finally {
     longTextState.isSubmitting = false;
@@ -1477,6 +2732,12 @@ async function submitLongTextEntries(entries, tabId) {
 
   if (restoreError) {
     throw new Error(`Long Text submitted, but regular mode was not restored: ${restoreError.message}`);
+  }
+  if (reconciliationRequired) {
+    throw new Error('Long Text may have been accepted; History reconciliation is required before continuing');
+  }
+  if (terminalFailure) {
+    throw new Error(terminalFailure);
   }
 
   return {
@@ -1577,7 +2838,7 @@ async function downloadReadyLongTextTask(task) {
 
 async function pollLongTextTasks() {
   await Promise.all([loadLongTextState(), loadBatchState(), loadParallelBatchState()]);
-  if (longTextState.isSubmitting || batchState.isRunning || parallelBatchState.isRunning) return;
+  if (longTextState.isSubmitting) return;
 
   const activeTasks = longTextState.tasks.filter((task) => {
     return ['awaiting_match', 'pending', 'ready', 'downloading'].includes(task.status);
@@ -1598,11 +2859,13 @@ async function pollLongTextTasks() {
     const claimedAudioIds = longTextState.tasks.map((task) => task.audioId).filter(Boolean);
     const response = await sendTabMessageWithTimeout(tabId, {
       action: 'queryLongTextHistory',
+      timeout: 30000,
       tasks: pendingTasks.map((task) => ({
         localId: task.localId,
         audioId: task.audioId,
         text: task.text,
         voiceId: task.voiceId,
+        voiceName: task.selectedVoiceName,
         submittedAt: task.submittedAt,
         excludedAudioIds: [...(longTextState.baselineAudioIds || []), ...claimedAudioIds]
       }))
@@ -1616,8 +2879,8 @@ async function pollLongTextTasks() {
       if (match.record) applyLongTextHistoryRecord(task, match.record);
       const submittedAt = Number(task.submittedAt || 0);
       if (!match.record && submittedAt && Date.now() - submittedAt > 24 * 60 * 60 * 1000) {
-        task.status = 'error';
-        task.error = 'Long Text task was not found in History within 24 hours';
+        task.status = 'reconciliation_required';
+        task.error = 'Long Text task is still unresolved after 24 hours; manual reconciliation is required';
       }
     });
   }
@@ -1641,6 +2904,7 @@ async function pollLongTextTasks() {
 
 function getDefaultParallelBatchState() {
   return {
+    phase: 'idle',
     isRunning: false,
     isPaused: false,
     isFallingBack: false,
@@ -1666,6 +2930,19 @@ async function loadParallelBatchState() {
   const data = await chrome.storage.local.get('parallelBatchState');
   parallelBatchState = data.parallelBatchState || getDefaultParallelBatchState();
   return parallelBatchState;
+}
+
+async function initializeParallelBatchState() {
+  await loadParallelBatchState();
+  if (parallelBatchState.phase !== 'preparing') return;
+  const secondaryTabId = parallelBatchState.secondaryTabId;
+  parallelBatchState.isRunning = false;
+  parallelBatchState.isPaused = false;
+  parallelBatchState.error = 'Parallel preparation was interrupted before regular workers started';
+  await saveParallelBatchState();
+  await closeTabSafely(secondaryTabId);
+  parallelBatchState.secondaryTabId = null;
+  await saveParallelBatchState();
 }
 
 async function saveParallelBatchState() {
@@ -1732,6 +3009,9 @@ function getParallelQueueSnapshot(queue) {
     id: entry.id,
     status: entry.status || 'pending',
     downloadConfirmed: entry.downloadConfirmed === true,
+    paidSubmissionStarted: entry.paidSubmissionStarted === true,
+    submissionRejected: entry.submissionRejected === true,
+    submittedAt: Number(entry.submittedAt || 0),
     error: entry.error || null
   }));
 }
@@ -1762,20 +3042,77 @@ async function closeTabSafely(tabId) {
   }
 }
 
+async function waitForAutomationStopped(tabId, timeoutMs = 15000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const runtime = await sendTabMessageWithTimeout(tabId, { action: 'getAutomationRuntimeState' }, 7000);
+      if (runtime?.success && !runtime.state?.isRunning) return true;
+    } catch (error) {
+      // A closed secondary tab is already stopped from the queue's perspective.
+      try {
+        await chrome.tabs.get(tabId);
+      } catch (tabError) {
+        return true;
+      }
+    }
+    await sleep(500);
+  }
+  return false;
+}
+
+async function stopPrimaryWorkerForFallback(tabId, runId) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await sendTabMessageWithTimeout(tabId, { action: 'stopAutomation', runId }, 7000);
+    } catch (error) {
+      // Retry after the runtime-state check below; a reload is the final recovery path.
+    }
+    if (await waitForAutomationStopped(tabId)) return;
+  }
+
+  // A reload terminates an unresponsive content-script run without requiring a user action.
+  await chrome.tabs.reload(tabId);
+  await waitForParallelTab(tabId, 45000);
+  if (!await waitForAutomationStopped(tabId, 10000)) {
+    throw new Error('Не удалось остановить основной поток для автоматического восстановления');
+  }
+}
+
 function sendTabMessageWithTimeout(tabId, message, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`Tab message timed out: ${message.action}`)), timeoutMs);
-    chrome.tabs.sendMessage(tabId, message).then(
-      (response) => {
-        clearTimeout(timer);
-        resolve(response);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
+    const finish = (callback, value) => {
+      clearTimeout(timer);
+      callback(value);
+    };
+    const send = () => chrome.tabs.sendMessage(tabId, message).then(
+      (response) => finish(resolve, response),
+      async (error) => {
+        // Long Text polling can outlive a page reload. Reinject only after Chrome
+        // confirms that this tab has no receiver, then retry the original request.
+        if (!String(error?.message || '').includes('Receiving end does not exist')) {
+          finish(reject, error);
+          return;
+        }
+        try {
+          await chrome.scripting.executeScript({ target: { tabId }, files: ['voice_mapping.js', 'content_script.js'] });
+          await sleep(250);
+          const response = await chrome.tabs.sendMessage(tabId, message);
+          finish(resolve, response);
+        } catch (retryError) {
+          finish(reject, retryError);
+        }
       }
     );
+    send();
   });
+}
+
+async function assertDirectTtsCapability(tabId) {
+  const response = await sendTabMessageWithTimeout(tabId, { action: 'getDirectTtsCapability' }, 10000);
+  if (response?.success && response?.ok) return;
+  throw new Error(`MiniMax direct TTS is incompatible: ${response?.reason || 'direct_tts_capability_unavailable'}`);
 }
 
 function getParallelProgress() {
@@ -1812,19 +3149,21 @@ async function broadcastParallelProgress() {
 }
 
 function buildRemainingParallelJobs() {
-  const completedKeys = new Set((parallelBatchState.workers || []).flatMap((worker) => {
+  const protectedKeys = new Set((parallelBatchState.workers || []).flatMap((worker) => {
     return (worker.queue || [])
       .filter((entry) => entry.status === 'completed'
         || entry.status === 'skipped_manual'
         || entry.status === 'skipped_voice_not_found'
-        || entry.downloadConfirmed)
+        || entry.downloadConfirmed
+        || entry.paidSubmissionStarted
+        || entry.submissionRejected)
       .map((entry) => entry._parallelKey);
   }));
 
   return (parallelBatchState.originalJobs || [])
     .map((job) => ({
       ...job,
-      queue: job.queue.filter((entry) => !completedKeys.has(entry._parallelKey))
+      queue: job.queue.filter((entry) => !protectedKeys.has(entry._parallelKey))
     }))
     .filter((job) => job.queue.length > 0);
 }
@@ -1851,14 +3190,31 @@ async function fallbackParallelBatch(reason) {
 
   const primaryTabId = parallelBatchState.primaryTabId;
   const secondaryTabId = parallelBatchState.secondaryTabId;
-  await Promise.allSettled((parallelBatchState.workers || []).map((worker) => {
+  await Promise.allSettled((parallelBatchState.workers || []).filter((worker) => worker.tabId !== primaryTabId).map((worker) => {
     return sendTabMessageWithTimeout(worker.tabId, {
       action: 'stopAutomation',
       runId: parallelBatchState.runId,
       workerId: worker.workerId
     }, 7000);
   }));
-  await sleep(500);
+  await stopPrimaryWorkerForFallback(primaryTabId, parallelBatchState.runId);
+
+  const unresolvedPaidEntries = (parallelBatchState.workers || []).flatMap((worker) => (
+    (worker.queue || []).filter((entry) => entry.paidSubmissionStarted && !entry.downloadConfirmed)
+  ));
+  if (unresolvedPaidEntries.length > 0) {
+    parallelBatchState.isRunning = false;
+    parallelBatchState.isFallingBack = false;
+    parallelBatchState.error = 'Paid submissions require History reconciliation before retry';
+    await saveParallelBatchState();
+    await chrome.alarms.clear('parallelBatchWatchdog');
+    await closeTabSafely(secondaryTabId);
+    chrome.runtime.sendMessage({
+      action: 'automationError',
+      error: 'Параллельный пакет остановлен: отправленные задачи требуют сверки с History перед повтором.'
+    }).catch(() => {});
+    return;
+  }
 
   const remainingJobs = buildRemainingParallelJobs();
   parallelBatchState = getDefaultParallelBatchState();
@@ -1890,7 +3246,18 @@ async function updateParallelWorker(request, sender, isComplete = false) {
   const worker = parallelBatchState.workers.find((item) => item.workerId === request.workerId);
   if (!worker || (sender.tab?.id && worker.tabId !== sender.tab.id)) return;
 
-  worker.queue = Array.isArray(request.queue) ? getParallelQueueSnapshot(request.queue) : worker.queue;
+  if (Array.isArray(request.queue)) {
+    const persistedByKey = new Map((worker.queue || []).map((entry) => [entry._parallelKey, entry]));
+    worker.queue = getParallelQueueSnapshot(request.queue).map((entry) => {
+      const persisted = persistedByKey.get(entry._parallelKey);
+      if (!persisted?.paidSubmissionStarted) return entry;
+      return {
+        ...entry,
+        paidSubmissionStarted: true,
+        submittedAt: Number(persisted.submittedAt || entry.submittedAt || 0)
+      };
+    });
+  }
   worker.currentIndex = Number(request.currentIndex ?? request.completed ?? worker.currentIndex ?? 0);
   worker.total = worker.queue.length;
   worker.lastProgressAt = Date.now();
@@ -1909,26 +3276,36 @@ async function updateParallelWorker(request, sender, isComplete = false) {
   }
 }
 
-async function startParallelBatchProcessing(jobs, primaryTabId) {
+async function prepareParallelBatchProcessing(jobs, primaryTabId) {
   await Promise.all([loadBatchState(), loadParallelBatchState()]);
   if (batchState.isRunning || parallelBatchState.isRunning) {
-    return { success: false, reason: 'automation_already_running' };
+    throw new Error('automation_already_running');
   }
 
   const originalJobs = annotateParallelJobs(jobs);
   const plan = buildParallelPlan(originalJobs);
-  if (!plan.ok) {
-    await startLegacyBatchProcessing(originalJobs, primaryTabId);
-    return { success: true, parallel: false, fallback: true, reason: plan.reason };
-  }
+  if (!plan.ok) throw new Error(plan.reason);
 
   let secondaryTab = null;
   try {
     await waitForParallelTab(primaryTabId, 10000);
     secondaryTab = await chrome.tabs.create({ url: MINIMAX_TTS_URL, active: false });
+    const runId = `parallel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    parallelBatchState = {
+      ...getDefaultParallelBatchState(),
+      phase: 'preparing',
+      runId,
+      primaryTabId,
+      secondaryTabId: secondaryTab.id,
+      originalJobs,
+      startedAt: Date.now()
+    };
+    await saveParallelBatchState();
     await waitForParallelTab(secondaryTab.id);
 
-    const runId = `parallel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    await assertDirectTtsCapability(primaryTabId);
+    await assertDirectTtsCapability(secondaryTab.id);
+
     const workers = plan.workers.map((worker, index) => ({
       ...worker,
       tabId: index === 0 ? primaryTabId : secondaryTab.id,
@@ -1943,13 +3320,46 @@ async function startParallelBatchProcessing(jobs, primaryTabId) {
       return sendTabMessageWithTimeout(worker.tabId, {
         action: 'prepareParallelWorker',
         voiceId: firstEntry.voiceId,
+        voiceName: firstEntry.voiceName,
         language: firstEntry.language || 'Auto'
-      }, 30000).then((response) => {
+      // A fresh secondary tab must load My Voices before applying an Instant Clone.
+      // This is materially slower than the already-warm primary tab.
+      }, 60000).then((response) => {
         if (!response?.success) throw new Error(response?.reason || 'Worker preflight failed');
       });
     }));
 
+    parallelBatchState.workers = workers.map((worker) => ({
+      ...worker,
+      queue: getParallelQueueSnapshot(worker.queue)
+    }));
+    await saveParallelBatchState();
+    return { runId, originalJobs, secondaryTab, workers };
+  } catch (error) {
+    await closeTabSafely(secondaryTab?.id);
+    parallelBatchState = getDefaultParallelBatchState();
+    await saveParallelBatchState();
+    throw error;
+  }
+}
+
+async function discardPreparedParallelBatch(prepared) {
+  await closeTabSafely(prepared?.secondaryTab?.id);
+  await loadParallelBatchState();
+  if (parallelBatchState.phase !== 'preparing') return;
+  if (prepared?.runId && parallelBatchState.runId !== prepared.runId) return;
+  parallelBatchState = getDefaultParallelBatchState();
+  await saveParallelBatchState();
+}
+
+async function startParallelBatchProcessing(jobs, primaryTabId, prepared = null) {
+  let context = prepared;
+  try {
+    if (!context) context = await prepareParallelBatchProcessing(jobs, primaryTabId);
+    const { runId, originalJobs, secondaryTab, workers } = context;
+
     parallelBatchState = {
+      phase: 'running',
       isRunning: true,
       isPaused: false,
       isFallingBack: false,
@@ -1985,12 +3395,34 @@ async function startParallelBatchProcessing(jobs, primaryTabId) {
     return { success: true, parallel: true, runId, workerCount: workers.length };
   } catch (error) {
     if (parallelBatchState.isRunning) {
-      await fallbackParallelBatch(error.message);
-      return { success: true, parallel: false, fallback: true, reason: error.message };
+      const tabIds = parallelBatchState.workers.map((worker) => worker.tabId);
+      const secondaryTabId = parallelBatchState.secondaryTabId;
+      await Promise.allSettled(tabIds.map((tabId) => sendTabMessageWithTimeout(tabId, { action: 'stopAutomation' }, 7000)));
+      const unconfirmedWorkers = [];
+      for (const worker of parallelBatchState.workers) {
+        try {
+          await confirmAutomationStopped(worker.tabId, (runtime) => (
+            runtime.runId === parallelBatchState.runId && runtime.workerId === worker.workerId
+          ));
+        } catch (stopError) {
+          unconfirmedWorkers.push(worker.workerId);
+        }
+      }
+      await chrome.alarms.clear('parallelBatchWatchdog');
+      if (unconfirmedWorkers.length === 0) {
+        parallelBatchState = getDefaultParallelBatchState();
+        await saveParallelBatchState();
+        await closeTabSafely(secondaryTabId);
+      } else {
+        parallelBatchState.isRunning = false;
+        parallelBatchState.isPaused = false;
+        parallelBatchState.error = `Parallel startup failed; Stop unconfirmed for workers: ${unconfirmedWorkers.join(', ')}`;
+        await saveParallelBatchState();
+      }
+    } else {
+      await closeTabSafely(context?.secondaryTab?.id);
     }
-    await closeTabSafely(secondaryTab?.id);
-    await startLegacyBatchProcessing(originalJobs, primaryTabId);
-    return { success: true, parallel: false, fallback: true, reason: error.message };
+    return { success: false, parallel: false, reason: error.message };
   }
 }
 
@@ -2045,15 +3477,33 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 let batchState = {
   queue: [],
   activeTabId: null,
-  isRunning: false
+  isRunning: false,
+  activeJob: null,
+  recoveryRequired: false,
+  error: null
 };
+let legacyBatchOperationQueue = Promise.resolve();
+
+function queueLegacyBatchOperation(operation) {
+  const result = legacyBatchOperationQueue.then(operation);
+  legacyBatchOperationQueue = result.catch(() => {});
+  return result;
+}
 
 // Загружаем состояние при старте воркера
 async function loadBatchState() {
   try {
     const data = await chrome.storage.local.get('batchState');
     if (data.batchState) {
-      batchState = data.batchState;
+      batchState = {
+        queue: [],
+        activeTabId: null,
+        isRunning: false,
+        activeJob: null,
+        recoveryRequired: false,
+        error: null,
+        ...data.batchState
+      };
       console.log('[Background] Batch state loaded:', batchState);
     }
   } catch (e) {
@@ -2063,41 +3513,115 @@ async function loadBatchState() {
 
 // Сохраняем состояние в storage
 async function saveBatchState() {
-  try {
-    await chrome.storage.local.set({ batchState });
-    console.log('[Background] Batch state saved');
-  } catch (e) {
-    console.error('[Background] Error saving batch state:', e);
-  }
+  await chrome.storage.local.set({ batchState });
+  console.log('[Background] Batch state saved');
 }
 
 async function startLegacyBatchProcessing(jobs, tabId) {
-  batchState = {
-    queue: Array.isArray(jobs) ? jobs : [],
-    activeTabId: tabId,
-    isRunning: true
-  };
-  await saveBatchState();
-  processNextBatchItem().catch((error) => {
-    console.error('[Background] Legacy batch start failed:', error);
+  return queueLegacyBatchOperation(async () => {
+    await loadBatchState();
+    if (batchState.activeJob || batchState.recoveryRequired) {
+      return { success: false, reason: 'legacy_batch_reconciliation_required' };
+    }
+    batchState = {
+      queue: Array.isArray(jobs) ? jobs : [],
+      activeTabId: tabId,
+      isRunning: true,
+      activeJob: null,
+      recoveryRequired: false,
+      error: null
+    };
+    await saveBatchState();
+    return processNextBatchItemLocked();
   });
+}
+
+async function initializeLegacyBatchState() {
+  await loadBatchState();
+  if (!batchState.isRunning) return;
+  if (batchState.activeJob) {
+    let runtime = null;
+    try {
+      runtime = await sendTabMessageWithTimeout(
+        batchState.activeTabId,
+        { action: 'getAutomationRuntimeState' },
+        7000
+      );
+    } catch (error) {}
+    if (runtime?.success
+      && runtime.state?.isRunning
+      && runtime.state?.legacyJobId === batchState.activeJob.legacyJobId) {
+      return;
+    }
+    batchState.isRunning = false;
+    batchState.recoveryRequired = true;
+    batchState.error = 'Active file was interrupted; automatic retry is blocked to prevent duplicate generation';
+    await saveBatchState();
+    return;
+  }
+  if (!batchState.activeTabId || batchState.queue.length === 0) {
+    batchState.isRunning = false;
+    await saveBatchState();
+    return;
+  }
+  await processNextBatchItemLocked();
 }
 
 async function startLongTextAwareBatch(jobs, tabId, useParallel) {
   await Promise.all([loadBatchState(), loadParallelBatchState(), loadLongTextState()]);
+  assertLongTextLimits(jobs);
+  if (batchState.activeJob || batchState.recoveryRequired) {
+    return { success: false, reason: 'legacy_batch_reconciliation_required' };
+  }
+  if (parallelBatchState.runId) {
+    return { success: false, reason: 'parallel_batch_reconciliation_required' };
+  }
+  await assertDirectTtsCapability(tabId);
+  const unresolvedRegularSubmissions = await reconcileRegularSubmissionLedger(tabId);
+  if (unresolvedRegularSubmissions.length > 0) {
+    return { success: false, reason: 'regular_submission_reconciliation_required' };
+  }
   if (batchState.isRunning || parallelBatchState.isRunning || getLongTextSummary().hasActive) {
     return { success: false, reason: 'automation_already_running' };
   }
 
   const { longTextEntries, regularJobs } = partitionLongTextJobs(jobs);
-  const longTextResult = await submitLongTextEntries(longTextEntries, tabId);
+  let preparedParallel = null;
+  let parallelFallbackReason = '';
+  if (useParallel && regularJobs.length > 0) {
+    const plan = buildParallelPlan(regularJobs);
+    if (!plan.ok) {
+      useParallel = false;
+      parallelFallbackReason = plan.reason;
+    } else {
+      try {
+        preparedParallel = await prepareParallelBatchProcessing(regularJobs, tabId);
+      } catch (error) {
+        return { success: false, parallel: false, reason: error.message };
+      }
+    }
+  }
+  let longTextResult;
+  try {
+    longTextResult = await submitLongTextEntries(longTextEntries, tabId);
+  } catch (error) {
+    await discardPreparedParallelBatch(preparedParallel);
+    throw error;
+  }
   let regularResult = { success: true, parallel: false };
 
   if (regularJobs.length > 0) {
+    if (longTextStopRequested) {
+      await discardPreparedParallelBatch(preparedParallel);
+      throw new Error('Automation stopped before regular submission');
+    }
     if (useParallel) {
-      regularResult = await startParallelBatchProcessing(regularJobs, tabId);
+      regularResult = await startParallelBatchProcessing(regularJobs, tabId, preparedParallel);
     } else {
-      await startLegacyBatchProcessing(regularJobs, tabId);
+      regularResult = await startLegacyBatchProcessing(regularJobs, tabId);
+      if (parallelFallbackReason && regularResult.success !== false) {
+        regularResult = { ...regularResult, fallback: true, reason: parallelFallbackReason };
+      }
     }
   }
 
@@ -2111,13 +3635,41 @@ async function startLongTextAwareBatch(jobs, tabId, useParallel) {
 }
 
 // Инициализация при пробуждении Service Worker
-loadBatchState();
-queueParallelOperation(() => initializeLongTextState()).catch((error) => {
+queueLegacyBatchOperation(() => initializeLegacyBatchState()).catch((error) => {
+  console.error('[Background] Legacy batch state initialization failed:', error);
+});
+queueParallelOperation(() => initializeParallelBatchState()).catch((error) => {
+  console.error('[Background] Parallel batch state initialization failed:', error);
+});
+queueLongTextSubmission(() => initializeLongTextState()).catch((error) => {
   console.error('[Background] Long Text state initialization failed:', error);
 });
 
 // Слушаем команды от POPUP и CONTENT SCRIPT
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === 'getSubmissionRecoveryStatus') {
+    Promise.all([loadBatchState(), loadParallelBatchState()])
+      .then(() => getSubmissionRecoverySummary())
+      .then((summary) => sendResponse({ success: true, summary: {
+        ...summary,
+        legacyRecoveryRequired: batchState.recoveryRequired === true,
+        parallelRecoveryRequired: !parallelBatchState.isRunning && !!parallelBatchState.runId
+      } }))
+      .catch((error) => sendResponse({ success: false, reason: error.message }));
+    return true;
+  }
+
+  if (request.action === 'resolveSubmissionRecovery') {
+    if (request.confirmed !== true) {
+      sendResponse({ success: false, reason: 'confirmation_required' });
+      return true;
+    }
+    queueParallelOperation(() => resolveSubmissionRecovery(request.tabId || null))
+      .then(sendResponse)
+      .catch((error) => sendResponse({ success: false, reason: error.message }));
+    return true;
+  }
+
   if (request.action === 'getLongTextStatus') {
     queueParallelOperation(async () => {
       await loadLongTextState();
@@ -2129,51 +3681,47 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === "getBatchStatus") {
-    Promise.all([loadBatchState(), loadParallelBatchState()]).then(async () => {
+    queueLegacyBatchOperation(async () => {
+      await Promise.all([loadBatchState(), loadParallelBatchState()]);
       if (parallelBatchState.isRunning) {
-        sendResponse({
+        return {
           success: true,
           isRunning: true,
           isParallel: true,
           state: parallelBatchState,
           runtime: { ...getParallelProgress(), mode: 'multi' }
-        });
-        return;
+        };
       }
       if (!batchState.isRunning || !batchState.activeTabId) {
-        sendResponse({ success: true, isRunning: false, state: batchState });
-        return;
+        return { success: true, isRunning: false, state: batchState };
       }
 
-      chrome.tabs.sendMessage(batchState.activeTabId, { action: 'getAutomationRuntimeState' }, async (runtimeResponse) => {
-        const hasRuntimeError = !!chrome.runtime.lastError;
-        const runtimeRunning = !!(runtimeResponse?.success && runtimeResponse?.state?.isRunning);
+      let runtimeResponse = null;
+      try {
+        runtimeResponse = await sendTabMessageWithTimeout(
+          batchState.activeTabId,
+          { action: 'getAutomationRuntimeState' },
+          7000
+        );
+      } catch (error) {}
+      if (runtimeResponse?.success
+        && runtimeResponse.state?.isRunning
+        && runtimeResponse.state?.legacyJobId === batchState.activeJob?.legacyJobId) {
+        return { success: true, isRunning: true, state: batchState, runtime: runtimeResponse.state };
+      }
 
-        if (hasRuntimeError || !runtimeRunning) {
-          batchState.isRunning = false;
-          batchState.activeTabId = null;
-          batchState.queue = [];
-          await saveBatchState();
-          await ensureAutomationStateLoaded();
-          await saveAutomationState({
-            progress: {
-              ...(automationState.progress || {}),
-              isRunning: false,
-              isPaused: false
-            }
-          });
-          sendResponse({ success: true, isRunning: false, state: batchState });
-          return;
-        }
-
-        sendResponse({
-          success: true,
-          isRunning: true,
-          state: batchState,
-          runtime: runtimeResponse.state
-        });
+      batchState.isRunning = false;
+      batchState.recoveryRequired = !!batchState.activeJob;
+      batchState.error = batchState.activeJob
+        ? 'Active file was interrupted; automatic retry is blocked to prevent duplicate generation'
+        : null;
+      await saveBatchState();
+      await ensureAutomationStateLoaded();
+      await saveAutomationState({
+        progress: { ...(automationState.progress || {}), isRunning: false, isPaused: false }
       });
-    }).catch((error) => {
+      return { success: true, isRunning: false, state: batchState };
+    }).then(sendResponse).catch((error) => {
       console.error('[Background] getBatchStatus error:', error);
       sendResponse({ success: false, reason: error.message });
     });
@@ -2183,27 +3731,25 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   
   // 1. Команда от POPUP: Начать обработку списка файлов
   if (request.action === "startBatchProcessing") {
-    if (!extensionEnabled) {
-      sendResponse({ success: false, reason: 'disabled' });
-      return;
-    }
-    
-    console.log(`[Background] Получен пакет задач: ${request.jobs.length} файлов`);
-    queueParallelOperation(async () => {
+    extensionEnabledReady.then(() => {
+      if (!extensionEnabled) return { success: false, reason: 'disabled' };
+      console.log(`[Background] Получен пакет задач: ${request.jobs.length} файлов`);
+      return queueParallelOperation(async () => {
+        longTextStopRequested = false;
         return startLongTextAwareBatch(request.jobs, request.tabId, false);
-      })
-      .then(sendResponse)
-      .catch((error) => sendResponse({ success: false, reason: error.message }));
+      });
+    }).then(sendResponse).catch((error) => sendResponse({ success: false, reason: error.message }));
     return true;
   }
 
   if (request.action === "startParallelBatchProcessing") {
-    if (!extensionEnabled) {
-      sendResponse({ success: false, reason: 'disabled' });
-      return;
-    }
-    queueParallelOperation(() => startLongTextAwareBatch(request.jobs, request.tabId, true))
-      .then(sendResponse)
+    extensionEnabledReady.then(() => {
+      if (!extensionEnabled) return { success: false, reason: 'disabled' };
+      return queueParallelOperation(() => {
+        longTextStopRequested = false;
+        return startLongTextAwareBatch(request.jobs, request.tabId, true);
+      });
+    }).then(sendResponse)
       .catch((error) => sendResponse({ success: false, reason: error.message }));
     return true;
   }
@@ -2215,6 +3761,203 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return;
   }
 
+  if (request.action === 'automationProgress' && !request.runId) {
+    queueLegacyBatchOperation(async () => {
+      await loadBatchState();
+      if (!batchState.activeJob) return;
+      if (sender.tab?.id !== batchState.activeTabId) return;
+      if (request.legacyJobId !== batchState.activeJob.legacyJobId) return;
+      batchState.activeJob.queue = Array.isArray(request.queue) ? request.queue : batchState.activeJob.queue;
+      batchState.activeJob.currentIndex = Number(request.currentIndex || 0);
+      batchState.activeJob.lastProgressAt = Date.now();
+      batchState.activeJob.phase = 'running';
+      await saveBatchState();
+    }).catch((error) => console.error('[Background] Legacy progress persistence failed:', error));
+    return;
+  }
+
+  if (request.action === 'reservePaidSubmission' && request.runId) {
+    queueParallelOperation(async () => {
+      await loadParallelBatchState();
+      if (!parallelBatchState.isRunning || parallelBatchState.runId !== request.runId) {
+        throw new Error('parallel_run_not_active');
+      }
+      const worker = parallelBatchState.workers.find((item) => item.workerId === request.workerId);
+      if (worker?.tabId !== sender.tab?.id) throw new Error('parallel_worker_owner_mismatch');
+      const entry = worker?.queue?.find((item) => item._parallelKey === request.parallelKey);
+      if (!entry) throw new Error('parallel_entry_not_found');
+      entry.paidSubmissionStarted = true;
+      entry.submittedAt = Number(request.submittedAt || Date.now());
+      await saveParallelBatchState();
+      return { success: true };
+    }).then(sendResponse).catch((error) => {
+      sendResponse({ success: false, reason: error.message });
+    });
+    return true;
+  }
+
+  if (request.action === 'reserveRegularSubmission') {
+    const submissionId = String(request.submissionId || '');
+    const ownerTabId = sender.tab?.id;
+    if (!submissionId || !ownerTabId) {
+      sendResponse({ success: false, reason: !submissionId ? 'submission_id_missing' : 'submission_owner_missing' });
+      return;
+    }
+    queueRegularSubmissionLedger(() => saveRegularSubmission({
+      submissionId,
+      submittedAt: Number(request.submittedAt || Date.now()),
+      runId: request.runId || null,
+      workerId: request.workerId || null,
+      parallelKey: request.parallelKey || null,
+      text: String(request.text || ''),
+      voiceId: String(request.voiceId || ''),
+      voiceName: String(request.voiceName || ''),
+      transport: String(request.transport || 'unknown'),
+      phase: 'reserved',
+      baselineAudioIds: Array.isArray(request.baselineAudioIds) ? request.baselineAudioIds.map(String) : [],
+      speakerName: String(request.speakerName || ''),
+      scriptName: request.scriptName || null,
+      downloadIndex: Number(request.downloadIndex || 0),
+      downloadLayout: request.downloadLayout || null,
+      sourceFileName: request.sourceFileName || null,
+      sourceFileBaseName: request.sourceFileBaseName || null,
+      ownerTabId,
+      completedAt: null
+    })).then(() => sendResponse({ success: true })).catch((error) => {
+      sendResponse({ success: false, reason: error.message });
+    });
+    return true;
+  }
+
+  if (request.action === 'markRegularSubmissionSent') {
+    const submissionId = String(request.submissionId || '');
+    queueRegularSubmissionLedger(async () => {
+      const unresolved = await getUnresolvedRegularSubmissions();
+      const entry = unresolved.find((item) => item.submissionId === submissionId);
+      if (!entry) throw new Error('regular_submission_not_found');
+      if (entry.ownerTabId !== sender.tab?.id) throw new Error('regular_submission_owner_mismatch');
+      entry.phase = 'sent';
+      entry.sentAt = Number(request.sentAt || Date.now());
+      await saveRegularSubmission(entry);
+    }).then(() => sendResponse({ success: true })).catch((error) => {
+      sendResponse({ success: false, reason: error.message });
+    });
+    return true;
+  }
+
+  if (request.action === 'completeRegularSubmission') {
+    queueRegularSubmissionLedger(async () => {
+      const submissionId = String(request.submissionId || '');
+      const unresolved = await getUnresolvedRegularSubmissions();
+      const entry = unresolved.find((item) => item.submissionId === submissionId);
+      if (!entry) return;
+      if (entry.ownerTabId !== sender.tab?.id) throw new Error('regular_submission_owner_mismatch');
+      await completeRegularSubmission(submissionId);
+    })
+      .then(() => sendResponse({ success: true }))
+      .catch((error) => sendResponse({ success: false, reason: error.message }));
+    return true;
+  }
+
+  if (request.action === 'releasePaidSubmission' && request.runId) {
+    queueParallelOperation(async () => {
+      await loadParallelBatchState();
+      if (parallelBatchState.runId !== request.runId) {
+        throw new Error('parallel_run_not_active');
+      }
+      const worker = parallelBatchState.workers.find((item) => item.workerId === request.workerId);
+      if (worker?.tabId !== sender.tab?.id) throw new Error('parallel_worker_owner_mismatch');
+      const entry = worker?.queue?.find((item) => item._parallelKey === request.parallelKey);
+      if (!entry) throw new Error('parallel_entry_not_found');
+      entry.paidSubmissionStarted = false;
+      entry.submittedAt = 0;
+      const hasUnresolvedPaid = parallelBatchState.workers.some((item) => (
+        (item.queue || []).some((queuedEntry) => queuedEntry.paidSubmissionStarted && !queuedEntry.downloadConfirmed)
+      ));
+      if (!parallelBatchState.isRunning && !hasUnresolvedPaid) {
+        parallelBatchState = getDefaultParallelBatchState();
+      }
+      await saveParallelBatchState();
+      return { success: true };
+    }).then(sendResponse).catch((error) => {
+      sendResponse({ success: false, reason: error.message });
+    });
+    return true;
+  }
+
+  if (request.action === 'reserveLongTextSubmission') {
+    queueLongTextSubmission(async () => {
+      if (longTextState.monitorTabId !== sender.tab?.id) throw new Error('long_text_submission_owner_mismatch');
+      const task = longTextState.tasks.find((item) => item.localId === request.localId);
+      if (!task || task.status !== 'submitting') throw new Error('long_text_task_not_submitting');
+      task.submissionPhase = 'reserved';
+      task.reservedAt = Number(request.reservedAt || Date.now());
+      task.transport = String(request.transport || 'unknown');
+      await saveLongTextState();
+      return { success: true };
+    }).then(sendResponse).catch((error) => {
+      sendResponse({ success: false, reason: error.message });
+    });
+    return true;
+  }
+
+  if (request.action === 'markLongTextDispatched') {
+    queueLongTextSubmission(async () => {
+      if (longTextState.monitorTabId !== sender.tab?.id) throw new Error('long_text_submission_owner_mismatch');
+      const task = longTextState.tasks.find((item) => item.localId === request.localId);
+      if (!task || task.status !== 'submitting' || task.submissionPhase !== 'reserved') {
+        throw new Error('long_text_task_not_reserved');
+      }
+      task.submissionPhase = 'dispatched';
+      task.dispatchedAt = Number(request.dispatchedAt || Date.now());
+      task.submissionStartedAt = task.dispatchedAt;
+      task.submittedAt = task.dispatchedAt;
+      await saveLongTextState();
+      return { success: true };
+    }).then(sendResponse).catch((error) => {
+      sendResponse({ success: false, reason: error.message });
+    });
+    return true;
+  }
+
+  if (request.action === 'releaseLongTextReservation') {
+    queueLongTextSubmission(async () => {
+      if (longTextState.monitorTabId !== sender.tab?.id) throw new Error('long_text_submission_owner_mismatch');
+      const task = longTextState.tasks.find((item) => item.localId === request.localId);
+      if (!task) throw new Error('long_text_task_not_found');
+      task.submissionPhase = null;
+      task.reservedAt = null;
+      task.dispatchedAt = null;
+      task.submissionStartedAt = null;
+      task.submittedAt = null;
+      await saveLongTextState();
+      return { success: true };
+    }).then(sendResponse).catch((error) => {
+      sendResponse({ success: false, reason: error.message });
+    });
+    return true;
+  }
+
+  if (request.action === 'markLongTextRejected') {
+    queueLongTextSubmission(async () => {
+      if (longTextState.monitorTabId !== sender.tab?.id) throw new Error('long_text_submission_owner_mismatch');
+      const task = longTextState.tasks.find((item) => item.localId === request.localId);
+      if (!task) throw new Error('long_text_task_not_found');
+      task.submissionStartedAt = null;
+      task.submittedAt = null;
+      task.transport = 'direct_rejected';
+      task.submissionPhase = 'rejected';
+      task.reservedAt = null;
+      task.dispatchedAt = null;
+      task.error = String(request.reason || 'direct_long_text_rejected');
+      await saveLongTextState();
+      return { success: true };
+    }).then(sendResponse).catch((error) => {
+      sendResponse({ success: false, reason: error.message });
+    });
+    return true;
+  }
+
   // 2. Сигнал от CONTENT SCRIPT: Текущий файл завершен
   if (request.action === "automationComplete") {
     if (request.runId) {
@@ -2224,20 +3967,40 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return;
     }
     // Сначала обновляем состояние из storage (воркер мог спать)
-    loadBatchState().then(() => {
+    queueLegacyBatchOperation(async () => {
+      await loadBatchState();
+      if (!batchState.activeJob) return;
+      if (sender.tab?.id !== batchState.activeTabId) return;
+      if (request.legacyJobId !== batchState.activeJob.legacyJobId) return;
+      if (request.success !== true) {
+        batchState.isRunning = false;
+        batchState.recoveryRequired = request.unresolved === true;
+        batchState.error = request.error || 'Active file failed';
+        if (request.unresolved === true) {
+          batchState.activeJob.phase = 'unresolved';
+        } else {
+          batchState.activeJob = null;
+          batchState.activeTabId = null;
+        }
+        await saveBatchState();
+        return;
+      }
+      batchState.activeJob = null;
+      batchState.recoveryRequired = false;
+      batchState.error = null;
+      batchState.isRunning = batchState.queue.length > 0;
+      if (!batchState.isRunning) batchState.activeTabId = null;
+      await saveBatchState();
       if (batchState.isRunning && batchState.queue.length > 0) {
         console.log(`[Background] Файл завершен. Осталось файлов: ${batchState.queue.length}`);
         
         setTimeout(() => {
-          processNextBatchItem();
+          queueLegacyBatchOperation(() => processNextBatchItemLocked()).catch((error) => {
+            console.error('[Background] Legacy next item failed:', error);
+          });
         }, 3000);
-      } else if (batchState.isRunning && batchState.queue.length === 0) {
-        console.log(`[Background] Все файлы из пакета обработаны.`);
-        batchState.isRunning = false;
-        batchState.activeTabId = null;
-        saveBatchState();
       }
-    });
+    }).catch((error) => console.error('[Background] Legacy completion failed:', error));
   }
 
   if (request.action === 'pauseBatchProcessing' || request.action === 'resumeBatchProcessing') {
@@ -2247,7 +4010,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       const tabIds = parallelBatchState.isRunning
         ? parallelBatchState.workers.map((worker) => worker.tabId)
         : [batchState.activeTabId].filter(Boolean);
-      await Promise.allSettled(tabIds.map((tabId) => sendTabMessageWithTimeout(tabId, { action }, 7000)));
+      if (tabIds.length === 0) throw new Error('automation_worker_missing');
+      const acknowledgements = await Promise.allSettled(
+        tabIds.map((tabId) => sendTabMessageWithTimeout(tabId, { action }, 7000))
+      );
+      const failedAcknowledgement = acknowledgements.find((result) => (
+        result.status !== 'fulfilled' || result.value?.success !== true
+      ));
+      if (failedAcknowledgement) {
+        const reason = failedAcknowledgement.status === 'rejected'
+          ? failedAcknowledgement.reason?.message
+          : failedAcknowledgement.value?.reason;
+        throw new Error(reason || `${action}_not_acknowledged`);
+      }
       if (parallelBatchState.isRunning) {
         parallelBatchState.isPaused = action === 'pauseAutomation';
         await saveParallelBatchState();
@@ -2260,53 +4035,106 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // 3. Команда остановки
   if (request.action === "stopAutomation") {
+    longTextStopRequested = true;
+    if (longTextState.monitorTabId) {
+      chrome.tabs.sendMessage(longTextState.monitorTabId, { action: 'cancelLongTextSubmissions' }).catch(() => {});
+    }
     queueParallelOperation(async () => {
       await Promise.all([loadBatchState(), loadParallelBatchState()]);
       if (parallelBatchState.isRunning) {
         const tabIds = parallelBatchState.workers.map((worker) => worker.tabId);
         const secondaryTabId = parallelBatchState.secondaryTabId;
-        parallelBatchState = getDefaultParallelBatchState();
+        await Promise.allSettled(tabIds.map((tabId) => sendTabMessageWithTimeout(tabId, { action: 'stopAutomation' }, 7000)));
+        await loadParallelBatchState();
+        const unconfirmedWorkers = [];
+        for (const worker of parallelBatchState.workers || []) {
+          try {
+            await confirmAutomationStopped(worker.tabId, (runtime) => (
+              runtime.runId === parallelBatchState.runId && runtime.workerId === worker.workerId
+            ));
+          } catch (error) {
+            unconfirmedWorkers.push(worker.workerId);
+          }
+        }
+        if (unconfirmedWorkers.length > 0) {
+          parallelBatchState.isRunning = false;
+          parallelBatchState.isPaused = false;
+          parallelBatchState.error = `Stop is unconfirmed for workers: ${unconfirmedWorkers.join(', ')}`;
+          await saveParallelBatchState();
+          sendResponse({
+            success: false,
+            stopped: false,
+            recoveryRequired: true,
+            reason: parallelBatchState.error
+          });
+          return;
+        }
+        const hasUnresolvedPaid = (parallelBatchState.workers || []).some((worker) => (
+          (worker.queue || []).some((entry) => entry.paidSubmissionStarted && !entry.downloadConfirmed)
+        ));
+        if (hasUnresolvedPaid) {
+          parallelBatchState.isRunning = false;
+          parallelBatchState.isPaused = false;
+          parallelBatchState.error = 'Stopped with paid submissions awaiting History reconciliation';
+        } else {
+          parallelBatchState = getDefaultParallelBatchState();
+        }
         await saveParallelBatchState();
         await chrome.alarms.clear('parallelBatchWatchdog');
-        await Promise.allSettled(tabIds.map((tabId) => sendTabMessageWithTimeout(tabId, { action: 'stopAutomation' }, 7000)));
         await closeTabSafely(secondaryTabId);
         await saveAutomationState({
           progress: { currentIndex: 0, total: 0, completedIds: [], isRunning: false, isPaused: false, workerCount: 0 },
           mode: 'multi'
         });
+        sendResponse({ success: true, stopped: true, reconciliationRequired: hasUnresolvedPaid });
+        return;
+      }
+      return queueLegacyBatchOperation(async () => {
+        await loadBatchState();
+        const activeTabId = batchState.activeTabId;
+        let deliveryError = null;
+
+        if (activeTabId) {
+          try {
+            await chrome.tabs.sendMessage(activeTabId, { action: 'stopAutomation' });
+          } catch (error) {
+            deliveryError = error;
+          }
+        }
+
+        batchState.isRunning = false;
+        if (deliveryError && batchState.activeJob) {
+          batchState.recoveryRequired = true;
+          batchState.error = `Stop delivery failed; active file requires reconciliation: ${deliveryError.message}`;
+        } else {
+          batchState.queue = [];
+          batchState.activeTabId = null;
+          batchState.activeJob = null;
+          batchState.recoveryRequired = false;
+          batchState.error = null;
+        }
+        await saveBatchState();
+
+        await ensureAutomationStateLoaded();
+        await saveAutomationState({
+          progress: {
+            ...(automationState.progress || {}),
+            isRunning: false,
+            isPaused: false
+          }
+        });
+
+        if (deliveryError) {
+          sendResponse({
+            success: false,
+            stopped: false,
+            recoveryRequired: !!batchState.activeJob,
+            reason: deliveryError.message
+          });
+          return;
+        }
         sendResponse({ success: true, stopped: true });
-        return;
-      }
-      const activeTabId = batchState.activeTabId;
-      let deliveryError = null;
-
-      if (activeTabId) {
-        try {
-          await chrome.tabs.sendMessage(activeTabId, { action: 'stopAutomation' });
-        } catch (error) {
-          deliveryError = error;
-        }
-      }
-
-      batchState.isRunning = false;
-      batchState.queue = [];
-      batchState.activeTabId = null;
-      await saveBatchState();
-
-      await ensureAutomationStateLoaded();
-      await saveAutomationState({
-        progress: {
-          ...(automationState.progress || {}),
-          isRunning: false,
-          isPaused: false
-        }
       });
-
-      if (deliveryError) {
-        sendResponse({ success: true, stopped: true, warning: deliveryError.message });
-        return;
-      }
-      sendResponse({ success: true, stopped: true });
     }).catch((error) => {
       sendResponse({ success: false, reason: error.message });
     });
@@ -2315,43 +4143,67 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 // Функция отправки задачи во вкладку
-async function processNextBatchItem() {
+async function processNextBatchItemLocked() {
   // Загружаем актуальное состояние
   await loadBatchState();
   
-  if (!batchState.activeTabId || batchState.queue.length === 0) {
+  if (!batchState.activeTabId || batchState.queue.length === 0 || batchState.activeJob) {
     console.log('[Background] No more items or no active tab');
     return;
   }
 
-  const nextJob = batchState.queue[0];
+  const nextJob = batchState.queue.shift();
+  const legacyJobId = `legacy-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  batchState.activeJob = {
+    ...nextJob,
+    legacyJobId,
+    phase: 'dispatching',
+    currentIndex: 0,
+    dispatchedAt: Date.now()
+  };
+  batchState.recoveryRequired = false;
+  batchState.error = null;
+  await saveBatchState();
   
   console.log(`[Background] Запуск файла: ${nextJob.scriptName}`);
 
-  // Отправляем команду content_script'у
-  chrome.tabs.sendMessage(batchState.activeTabId, {
-    action: 'startAutomation',
-    queue: nextJob.queue,
-    mode: nextJob.mode,
-    scriptName: nextJob.scriptName
-  }, async (response) => {
-     if (chrome.runtime.lastError) {
-       console.error('[Background] Ошибка отправки во вкладку:', chrome.runtime.lastError);
-       setTimeout(() => {
-         if (batchState.isRunning) processNextBatchItem().catch(() => {});
-       }, 3000);
-       return;
-     }
+  try {
+    // Uses the same recovery path as Long Text polling. A TTS tab can be open
+    // before the extension reloads, leaving it without a content-script receiver.
+    const response = await sendTabMessageWithTimeout(batchState.activeTabId, {
+      action: 'startAutomation',
+      queue: nextJob.queue,
+      mode: nextJob.mode,
+      scriptName: nextJob.scriptName,
+      legacyJobId
+    }, 15000);
 
-     if (!response || !response.success) {
-       console.error('[Background] Вкладка не приняла startAutomation:', response);
-       setTimeout(() => {
-         if (batchState.isRunning) processNextBatchItem().catch(() => {});
-       }, 3000);
-       return;
-     }
+    if (!response?.success) {
+      throw new Error(response?.reason || 'start_automation_rejected');
+    }
 
-     batchState.queue.shift();
-     await saveBatchState();
-  });
+    batchState.activeJob.phase = 'running';
+    await saveBatchState();
+    return { success: true };
+  } catch (error) {
+    console.error('[Background] Failed to start automation in TTS tab:', error);
+    batchState.isRunning = false;
+    batchState.recoveryRequired = true;
+    batchState.error = `Active file dispatch is unresolved: ${error.message}`;
+    await saveBatchState();
+    await ensureAutomationStateLoaded();
+    await saveAutomationState({
+      progress: {
+        ...(automationState.progress || {}),
+        isRunning: false,
+        isPaused: false,
+        error: error.message
+      }
+    });
+    chrome.runtime.sendMessage({
+      action: 'automationError',
+      error: `Не удалось запустить в MiniMax: ${error.message}`
+    }).catch(() => {});
+    return { success: false, reason: error.message };
+  }
 }

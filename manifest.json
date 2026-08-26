@@ -28,7 +28,7 @@
   "content_scripts": [
     {
       "matches": ["https://www.minimax.io/audio/text-to-speech*"],
-      "js": ["content_script.js"]
+      "js": ["voice_mapping.js", "content_script.js"]
     }
   ],
   "action": {

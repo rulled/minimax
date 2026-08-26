@@ -70,7 +70,8 @@ function parseMarkdown(markdownText) {
     minimaxLanguage: '',
     niche: '',
     packId: '',
-    sourceTag: ''
+    sourceTag: '',
+    downloadIndex: null
   };
 
   const headerRegex = /^(?:\\)?\*\*(?:\\)?\*?(.+?)(?:\\)?\*?(?:\\)?\*\*(?:\s*:)?(.*)$/;
@@ -102,6 +103,11 @@ function parseMarkdown(markdownText) {
         currentContext.packId = metadata.value;
       } else if (metadata.key === 'source_tag') {
         currentContext.sourceTag = metadata.value;
+      } else if (metadata.key === 'download_index') {
+        const downloadIndex = Number(metadata.value);
+        currentContext.downloadIndex = Number.isInteger(downloadIndex) && downloadIndex > 0
+          ? downloadIndex
+          : null;
       }
       continue;
     }
@@ -124,9 +130,11 @@ function parseMarkdown(markdownText) {
         niche: currentContext.niche || '',
         packId: currentContext.packId || '',
         sourceTag: currentContext.sourceTag || '',
+        downloadIndex: currentContext.downloadIndex,
         text: inlineText,
         preview: ''
       };
+      currentContext.downloadIndex = null;
     } else if (currentEntry) {
       currentEntry.text += (currentEntry.text ? '\n' : '') + line;
     }

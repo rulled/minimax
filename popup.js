@@ -98,6 +98,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   const newCustomNameInput = document.getElementById('newCustomName');
   const counterValue = document.getElementById('counterValue');
   const resetButton = document.getElementById('resetButton');
+  const directTtsStatus = document.getElementById('directTtsStatus');
+  const submissionRecoveryArea = document.getElementById('submissionRecoveryArea');
+  const submissionRecoveryStatus = document.getElementById('submissionRecoveryStatus');
+  const resolveSubmissionRecoveryButton = document.getElementById('resolveSubmissionRecoveryButton');
+  const voiceCleanupQuota = document.getElementById('voiceCleanupQuota');
+  const voiceCleanupCapacityFill = document.getElementById('voiceCleanupCapacityFill');
+  const voiceCleanupDeleteButton = document.getElementById('voiceCleanupDeleteButton');
+  const voiceCleanupStatus = document.getElementById('voiceCleanupStatus');
 
   // Автоозвучка (Single)
   const uploadButton = document.getElementById('uploadButton');
@@ -127,6 +135,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const multiVoicePrefixInput = document.getElementById('multiVoicePrefixInput');
   const refreshSiteVoicesButton = document.getElementById('refreshSiteVoicesButton');
   const siteVoicesStatus = document.getElementById('siteVoicesStatus');
+  const voiceMappingInspectionStatus = document.getElementById('voiceMappingInspectionStatus');
   // Removed: const multiPreviewList = document.getElementById('multiPreviewList');
   // Removed: const multiSelectionCount = document.getElementById('multiSelectionCount');
   // Removed: const multiToggleSelectionBtn = document.getElementById('multiToggleSelectionBtn');
@@ -180,12 +189,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     'voiceMappings',
     'multiVoicePrefix',
     'cachedSiteVoices',
-    'parallelModeEnabled'
+    'parallelModeEnabled',
+    'directTtsLastResult'
   ]);
   let extensionEnabled = data.extensionEnabled !== false;
   const customNames = data.customNames || [];
   voiceMappings = data.voiceMappings || {}; 
-  cachedSiteVoices = Array.isArray(data.cachedSiteVoices) ? data.cachedSiteVoices : [];
+  cachedSiteVoices = Array.isArray(data.cachedSiteVoices)
+      ? data.cachedSiteVoices.filter(voice => voice && typeof voice === 'object' && voice.voiceId && voice.voiceName)
+      : [];
   parallelModeEnabled = data.parallelModeEnabled === true;
 
   let tabId = 'fallback-tab';
@@ -204,6 +216,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   initLanguageSelector();
   if (multiVoicePrefixInput) multiVoicePrefixInput.value = data.multiVoicePrefix || 'mp';
   if (parallelModeToggle) parallelModeToggle.checked = parallelModeEnabled;
+  const lastDirectResult = data.directTtsLastResult;
+  if (directTtsStatus) {
+      const modeLabel = 'Транспорт: прямой API.';
+      if (lastDirectResult) {
+          const code = lastDirectResult.code == null ? '' : ` · code ${lastDirectResult.code}`;
+          directTtsStatus.textContent = `${modeLabel} Последний: ${lastDirectResult.mode} / ${lastDirectResult.disposition}${code}`;
+      } else {
+          directTtsStatus.textContent = modeLabel;
+      }
+  }
+  await refreshSubmissionRecoveryStatus();
   if (parallelModeStatus && parallelModeEnabled) {
       parallelModeStatus.textContent = 'При запуске откроется вторая вкладка MiniMax.';
   }
@@ -214,6 +237,149 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadSkippedEntries();
   syncSingleBatchUi();
   ensureSingleEmptyUi();
+
+  function renderVoiceCleanupStatus(message, type = '') {
+      if (!voiceCleanupStatus) return;
+      voiceCleanupStatus.textContent = message || '';
+      voiceCleanupStatus.className = `voice-source-status${type ? ` ${type}` : ''}`;
+  }
+
+  async function refreshSubmissionRecoveryStatus() {
+      if (!submissionRecoveryArea || !submissionRecoveryStatus) return;
+      const response = await chrome.runtime.sendMessage({ action: 'getSubmissionRecoveryStatus' }).catch(() => null);
+      const summary = response?.summary;
+      const hasRecovery = response?.success && (
+          summary.total > 0 || summary.legacyRecoveryRequired || summary.parallelRecoveryRequired
+      );
+      submissionRecoveryArea.style.display = hasRecovery ? 'block' : 'none';
+      if (!hasRecovery) return;
+      submissionRecoveryStatus.textContent = `Требуется сверка History: regular ${summary.regular}, Long Text ${summary.longText}.`;
+  }
+
+  if (resolveSubmissionRecoveryButton) {
+      resolveSubmissionRecoveryButton.addEventListener('click', async () => {
+          const confirmed = confirm(
+              'Подтвердите, что вы проверили MiniMax History. Ненайденные задачи будут сняты с блокировки без автоматического повтора.'
+          );
+          if (!confirmed) return;
+          const tabs = await chrome.tabs.query({ url: 'https://www.minimax.io/audio/text-to-speech*' });
+          const response = await chrome.runtime.sendMessage({
+              action: 'resolveSubmissionRecovery',
+              confirmed: true,
+              tabId: tabs[0]?.id || null
+          }).catch((error) => ({ success: false, reason: error.message }));
+          if (!response?.success) {
+              showStatus(`Не удалось снять блокировку: ${response?.reason || 'unknown error'}`, 'error');
+              return;
+          }
+          showStatus('Блокировка снята без повторной генерации', 'success');
+          await refreshSubmissionRecoveryStatus();
+      });
+  }
+
+  function getProtectedVoiceNames() {
+      return [...new Set([
+          currentVoiceName,
+          ...Object.values(data.tabVoices || {}),
+          ...Object.values(voiceMappings)
+      ].map(value => String(value?.voiceName || value || '').trim()).filter(Boolean))];
+  }
+
+  function getProtectedVoiceIds() {
+      return [...new Set(Object.values(voiceMappings).map(value => String(value?.voiceId || '').trim()).filter(Boolean))];
+  }
+
+  async function getActiveMinimaxTab() {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      const activeTab = tabs[0];
+      if (!activeTab?.id || !String(activeTab.url || '').startsWith('https://www.minimax.io/audio/')) {
+          throw new Error('Откройте активной вкладку MiniMax Audio');
+      }
+      return activeTab;
+  }
+
+  function renderVoiceCleanupQuota(equity) {
+      const used = Number(equity?.used || 0);
+      const total = Number(equity?.total || 0);
+      if (voiceCleanupQuota) {
+          voiceCleanupQuota.textContent = total
+              ? `${used}/${total} занято · ${Math.max(0, total - used)} свободно`
+              : 'данные о слотах недоступны';
+      }
+      if (voiceCleanupCapacityFill) {
+          const percentage = total ? Math.min(100, Math.max(0, used / total * 100)) : 0;
+          voiceCleanupCapacityFill.style.width = `${percentage}%`;
+      }
+  }
+
+  async function refreshVoiceCleanupQuota() {
+      try {
+          const tab = await getActiveMinimaxTab();
+          const response = await chrome.tabs.sendMessage(tab.id, {
+              action: 'voiceCleanupPreview',
+              count: 20,
+              protectedVoiceNames: getProtectedVoiceNames(),
+              protectedVoiceIds: getProtectedVoiceIds()
+          });
+          if (response?.success) renderVoiceCleanupQuota(response.equity);
+      } catch (error) {
+          // The cleanup control remains usable when a MiniMax tab becomes active later.
+      }
+  }
+
+  async function deleteOldestVoices() {
+      voiceCleanupDeleteButton.disabled = true;
+      voiceCleanupDeleteButton.textContent = 'Проверяю...';
+      renderVoiceCleanupStatus('');
+      try {
+          const tab = await getActiveMinimaxTab();
+          const preview = await chrome.tabs.sendMessage(tab.id, {
+              action: 'voiceCleanupPreview',
+              count: 20,
+              protectedVoiceNames: getProtectedVoiceNames(),
+              protectedVoiceIds: getProtectedVoiceIds()
+          });
+          if (!preview?.success) throw new Error(preview?.reason || 'Не удалось получить список голосов');
+          renderVoiceCleanupQuota(preview.equity);
+
+          const candidates = Array.isArray(preview.candidates) ? preview.candidates : [];
+          if (candidates.length === 0) throw new Error('Нет старых Instant Clone для удаления');
+          if (!confirm(`Удалить ${candidates.length} самых старых Instant Clone? Отменить это действие нельзя.`)) {
+              renderVoiceCleanupStatus('Удаление отменено.');
+              return;
+          }
+
+          voiceCleanupDeleteButton.textContent = 'Удаляю...';
+          renderVoiceCleanupStatus('Не закрывайте MiniMax...');
+          const response = await chrome.tabs.sendMessage(tab.id, {
+              action: 'voiceCleanupDelete',
+              candidates,
+              protectedVoiceNames: getProtectedVoiceNames(),
+              protectedVoiceIds: getProtectedVoiceIds()
+          });
+          const deletedCount = Array.isArray(response?.deleted) ? response.deleted.length : 0;
+          if (response?.equity) renderVoiceCleanupQuota(response.equity);
+          if (!response?.success) {
+              if (deletedCount > 0 && !response?.equity) {
+                  if (voiceCleanupQuota) voiceCleanupQuota.textContent = 'слоты изменились · требуется обновление';
+                  if (voiceCleanupCapacityFill) voiceCleanupCapacityFill.style.width = '0%';
+              }
+              throw new Error(`${response?.reason || 'Удаление остановлено'}. Удалено: ${deletedCount}`);
+          }
+          cachedSiteVoices = [];
+          await chrome.storage.local.set({ cachedSiteVoices: [] });
+          renderSiteVoicesStatus('Список голосов изменился. Нажмите «Обновить».');
+          renderVoiceCleanupStatus(`Удалено: ${deletedCount}.`, 'success');
+      } catch (error) {
+          renderVoiceCleanupStatus(error.message, 'error');
+      } finally {
+          voiceCleanupDeleteButton.disabled = false;
+          voiceCleanupDeleteButton.textContent = 'Удалить 20 старых голосов';
+      }
+  }
+
+  if (voiceCleanupDeleteButton) voiceCleanupDeleteButton.addEventListener('click', deleteOldestVoices);
+  refreshVoiceCleanupQuota();
 
   // ============================================
   // 4. ЛОГИКА ВКЛАДОК
@@ -276,11 +442,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function normalizeLookupText(value) {
-      return String(value || '')
-          .toLowerCase()
-          .replace(/[_-]+/g, ' ')
-          .replace(/\s+/g, ' ')
-          .trim();
+      return VoiceMappingResolver.normalize(value);
   }
 
   function getVoiceMappingKey(speaker, languageCode = '') {
@@ -294,6 +456,31 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (voiceMappings[scopedKey]) return voiceMappings[scopedKey];
       if (String(languageCode || '').trim()) return '';
       return voiceMappings[String(speaker || '').trim()] || '';
+  }
+
+  function getMappingVoiceName(mapping) {
+      return String(mapping?.voiceName || mapping || '').trim();
+  }
+
+  function getMappingVoiceId(mapping) {
+      return String(mapping?.voiceId || '').trim();
+  }
+
+  function findUniqueVoiceByName(voiceName, voices = cachedSiteVoices) {
+      const matches = voices.filter(voice => voice.voiceName === String(voiceName || '').trim());
+      return matches.length === 1 ? matches[0] : null;
+  }
+
+  function migrateLegacyVoiceMappings(currentVoices) {
+      let changed = false;
+      Object.entries(voiceMappings).forEach(([key, mapping]) => {
+          if (typeof mapping !== 'string' || !mapping.trim()) return;
+          const match = findUniqueVoiceByName(mapping, currentVoices);
+          if (!match) return;
+          voiceMappings[key] = { voiceId: match.voiceId, voiceName: match.voiceName };
+          changed = true;
+      });
+      return changed;
   }
 
   function getEntryLanguageCode(entry, file = null) {
@@ -330,58 +517,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       };
   }
 
-  function inferVoiceRoleTokens(speaker) {
-      const normalized = normalizeLookupText(speaker);
-      const numberMatch = normalized.match(/\b(\d+)\b/);
-      const number = numberMatch ? numberMatch[1] : '';
-
-      if (/\b(doc|doctor|доктор)\b/.test(normalized)) {
-          return [['doc'], ['doctor'], ['доктор']];
-      }
-      if (/\b(dic|dictor|диктор|репортер|reporter)\b/.test(normalized)) {
-          return [['dic'], ['dictor'], ['диктор'], ['репортер'], ['reporter']];
-      }
-
-      const tokenSets = [];
-      if (/\bмуж(чина)?\b/.test(normalized)) {
-          if (number) tokenSets.push(['отзыв', 'мужчина', number], ['мужчина', number]);
-          tokenSets.push(['мужчина']);
-      }
-      if (/\bжен(щина)?\b/.test(normalized)) {
-          if (number) tokenSets.push(['отзыв', 'женщина', number], ['женщина', number]);
-          tokenSets.push(['женщина']);
-      }
-      if (number) tokenSets.push(['отзыв', number]);
-
-      const genericTokens = normalized.split(' ').filter(Boolean);
-      if (genericTokens.length) {
-          tokenSets.push(genericTokens);
-      }
-      return tokenSets;
-  }
-
   function findBestCachedVoiceMatch(speaker, languageCode = '') {
       if (!Array.isArray(cachedSiteVoices) || cachedSiteVoices.length === 0) return '';
-
-      const prefix = normalizeLookupText(multiVoicePrefixInput?.value || 'mp');
-      const normalizedLanguage = normalizeLookupText(languageCode);
-      const baseTokens = [prefix];
-      if (normalizedLanguage) baseTokens.push(normalizedLanguage);
-
-      const candidateTokenSets = inferVoiceRoleTokens(speaker).map(tokens => [...baseTokens, ...tokens]);
-      const normalizedVoices = cachedSiteVoices.map(voiceName => ({
-          original: voiceName,
-          normalized: normalizeLookupText(voiceName)
-      }));
-
-      for (const tokenSet of candidateTokenSets) {
-          const match = normalizedVoices.find(voice =>
-              tokenSet.every(token => voice.normalized.includes(normalizeLookupText(token)))
-          );
-          if (match) return match.original;
-      }
-
-      return '';
+      const result = VoiceMappingResolver.resolveVoice(
+          speaker,
+          languageCode,
+          cachedSiteVoices,
+          multiVoicePrefixInput?.value || 'mp'
+      );
+      return result.status === 'ok' ? result.voice : '';
   }
 
   function ensureAutoVoiceMappings() {
@@ -406,30 +550,81 @@ document.addEventListener('DOMContentLoaded', async () => {
           chrome.storage.local.set({ voiceMappings });
           saveState();
           saveBatchFiles();
+          // Автомаппинг меняет сводку голосов на карточках файлов — перерисовываем,
+          // иначе карточки остаются с устаревшим «Голоса не назначены».
+          renderBatchFilesList('multi');
       }
+  }
+
+  function buildVoiceMappingPlan() {
+      const mappings = new Map();
+      batchFiles_Multi.forEach(file => {
+          file.entries.forEach(entry => {
+              if (file.excludedIds.has(entry.id)) return;
+              const languageCode = getEntryLanguageCode(entry, file);
+              const key = getVoiceMappingKey(entry.speaker, languageCode);
+              const mapping = getVoiceMappingValue(entry.speaker, languageCode);
+              if (!mappings.has(key)) {
+                  mappings.set(key, {
+                      key,
+                      speaker: entry.speaker,
+                      languageCode,
+                      voiceId: getMappingVoiceId(mapping),
+                      voiceName: getMappingVoiceName(mapping),
+                      entryCount: 0,
+                      files: []
+                  });
+              }
+              const item = mappings.get(key);
+              item.entryCount += 1;
+              if (!item.files.includes(file.name)) item.files.push(file.name);
+          });
+      });
+      return {
+          prefix: String(multiVoicePrefixInput?.value || 'mp').trim(),
+          fileCount: batchFiles_Multi.length,
+          mappings: [...mappings.values()]
+      };
+  }
+
+  function renderVoiceMappingInspection(result, unavailable = false) {
+      if (!voiceMappingInspectionStatus) return;
+      if (unavailable) {
+          voiceMappingInspectionStatus.textContent = 'Live-проверка недоступна. Запуск заблокирован до восстановления связи с MiniMax.';
+          voiceMappingInspectionStatus.className = 'voice-source-status error';
+          return;
+      }
+      const totals = result?.totals || {};
+      voiceMappingInspectionStatus.textContent = result?.valid
+          ? `Проверено: ${totals.entries || 0} реплик, ${totals.mappings || 0} маппингов. Ошибок нет.`
+          : `Маппинг заблокирован: missing ${totals.missing || 0}, stale ${totals.stale || 0}, unavailable ${totals.unavailable || 0}, ambiguous ${totals.ambiguous || 0}, not found ${totals.notFound || 0}.`;
+      voiceMappingInspectionStatus.className = `voice-source-status ${result?.valid ? 'success' : 'error'}`;
+  }
+
+  async function inspectVoiceMappingPlan() {
+      const tabId = await getMinimaxTabId();
+      if (!tabId) {
+          throw new Error('Откройте MiniMax TTS для live-проверки маппинга');
+      }
+      const response = await chrome.tabs.sendMessage(tabId, {
+          action: 'inspectVoiceMappingPlan',
+          plan: buildVoiceMappingPlan()
+      }).catch((error) => ({ success: false, reason: error?.message || 'mapping_inspection_unavailable' }));
+      if (!response?.success) {
+          renderVoiceMappingInspection(null, true);
+          throw new Error(response?.reason || 'Не удалось проверить маппинг');
+      }
+      renderVoiceMappingInspection(response);
+      return { available: true, ...response };
   }
 
   function applyVoiceMappingValue(speaker, rawValue, languageCode = '') {
       const value = String(rawValue || '').trim();
       const scopedKey = getVoiceMappingKey(speaker, languageCode);
-      const normalizedLanguageCode = String(languageCode || '').trim().toUpperCase();
-      voiceMappings[scopedKey] = value;
-
-      batchFiles_Multi.forEach(file => {
-          const speakerEntryIds = file.entries
-              .filter(entry => {
-                  if (entry.speaker !== speaker) return false;
-                  if (!normalizedLanguageCode) return true;
-                  return getEntryLanguageCode(entry, file) === normalizedLanguageCode;
-              })
-              .map(entry => entry.id);
-
-          if (value) {
-              speakerEntryIds.forEach(id => file.excludedIds.delete(id));
-          } else {
-              speakerEntryIds.forEach(id => file.excludedIds.add(id));
-          }
-      });
+      const matchedVoice = findUniqueVoiceByName(value);
+      voiceMappings[scopedKey] = matchedVoice
+          ? { voiceId: matchedVoice.voiceId, voiceName: matchedVoice.voiceName }
+          : value;
 
       chrome.storage.local.set({ voiceMappings });
       saveState();
@@ -453,8 +648,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
 
           const response = await chrome.tabs.sendMessage(activeTab.id, {
-              action: 'listVoicesFromUi',
-              prefix
+              action: 'listMyVoices'
           }).catch((error) => ({
               success: false,
               reason: error?.message || 'content_script_unavailable'
@@ -465,8 +659,11 @@ document.addEventListener('DOMContentLoaded', async () => {
               return;
           }
 
-          cachedSiteVoices = Array.isArray(response.voices) ? response.voices : [];
-          await chrome.storage.local.set({ cachedSiteVoices });
+          const currentVoices = Array.isArray(response.voices) ? response.voices : [];
+          cachedSiteVoices = currentVoices.filter(voice => Number(voice.voiceStatus) === 2)
+              .filter(voice => !prefix || normalizeLookupText(voice.voiceName).includes(normalizeLookupText(prefix)));
+          const mappingsChanged = migrateLegacyVoiceMappings(currentVoices);
+          await chrome.storage.local.set({ cachedSiteVoices, ...(mappingsChanged ? { voiceMappings } : {}) });
           renderSiteVoicesStatus(
               cachedSiteVoices.length
                   ? `Загружено голосов: ${cachedSiteVoices.length}`
@@ -479,6 +676,77 @@ document.addEventListener('DOMContentLoaded', async () => {
           }
       } finally {
           if (refreshSiteVoicesButton) refreshSiteVoicesButton.disabled = false;
+      }
+  }
+
+  async function preflightQueueVoices(batchJobs, tabId) {
+      const hasMappedVoices = batchJobs.some(job => (job.queue || []).some(entry => (
+          String(entry.voiceId || '').trim() || String(entry.voiceName || '').trim()
+      )));
+      if (!hasMappedVoices) return;
+      const response = await chrome.tabs.sendMessage(tabId, { action: 'listMyVoices' }).catch((error) => ({
+          success: false,
+          reason: error?.message || 'content_script_unavailable'
+      }));
+      if (!response?.success) {
+          throw new Error(`Не удалось проверить My Voices: ${response?.reason || 'unknown error'}`);
+      }
+
+      const voicesById = new Map((response.voices || []).map(voice => [String(voice.voiceId || ''), voice]));
+      let mappingsChanged = migrateLegacyVoiceMappings(response.voices || []);
+      for (const job of batchJobs) {
+          for (const entry of job.queue || []) {
+              let voiceId = String(entry.voiceId || '').trim();
+              const voiceName = String(entry.voiceName || '').trim();
+              if (!voiceId && !voiceName) continue;
+              if (!voiceId) {
+                  const match = findUniqueVoiceByName(voiceName, response.voices || []);
+                  if (!match) {
+                      throw new Error(`Голос для «${entry.speaker || 'спикер'}» отсутствует или неоднозначен: ${voiceName}`);
+                  }
+                  entry.voiceId = match.voiceId;
+                  entry.voiceName = match.voiceName;
+                  voiceId = match.voiceId;
+              }
+              const currentVoice = voicesById.get(voiceId);
+              if (!currentVoice || Number(currentVoice.voiceStatus) !== 2) {
+                  throw new Error(`Голос для «${entry.speaker || 'спикер'}» недоступен: ${voiceName || voiceId}`);
+              }
+              entry.voiceName = currentVoice.voiceName;
+          }
+      }
+      Object.entries(voiceMappings).forEach(([key, mapping]) => {
+          const voiceId = getMappingVoiceId(mapping);
+          const currentVoice = voicesById.get(voiceId);
+          if (!currentVoice || getMappingVoiceName(mapping) === currentVoice.voiceName) return;
+          voiceMappings[key] = { voiceId: currentVoice.voiceId, voiceName: currentVoice.voiceName };
+          mappingsChanged = true;
+      });
+      if (mappingsChanged) await chrome.storage.local.set({ voiceMappings });
+  }
+
+  async function preflightGenerationCredit(batchJobs, tabId) {
+      const requestedCharacters = batchJobs.reduce((total, job) => (
+          total + (job.queue || []).reduce((sum, entry) => {
+              const length = String(entry.text || '').length;
+              return length > 0 && length <= 200000 ? sum + length : sum;
+          }, 0)
+      ), 0);
+      if (requestedCharacters === 0) return;
+      const response = await chrome.tabs.sendMessage(tabId, {
+          action: 'getGenerationCredit',
+          requestedCharacters
+      }).catch((error) => ({
+          success: false,
+          reason: error?.message || 'content_script_unavailable'
+      }));
+      if (!response?.success) {
+          throw new Error(`Не удалось проверить кредиты MiniMax: ${response?.reason || 'unknown error'}`);
+      }
+      if (!response.sufficient) {
+          throw new Error(
+              `Недостаточно кредитов MiniMax: нужно ${response.requiredCredit}, доступно ${response.totalCredit}`
+          );
       }
   }
 
@@ -1038,10 +1306,11 @@ document.addEventListener('DOMContentLoaded', async () => {
           const summaryKey = `${entryLanguageCode}::${entry.speaker}`;
           if (seenVoiceKeys.has(summaryKey)) return;
           seenVoiceKeys.add(summaryKey);
-          const voiceId = getVoiceMappingValue(entry.speaker, entryLanguageCode);
-          if (voiceId) {
-            const label = entryLanguageCode ? `[${entryLanguageCode}] ${entry.speaker}` : entry.speaker;
-            assignedVoices.push(`${label}: ${voiceId}`);
+           const mapping = getVoiceMappingValue(entry.speaker, entryLanguageCode);
+           const voiceName = getMappingVoiceName(mapping);
+           if (voiceName) {
+             const label = entryLanguageCode ? `[${entryLanguageCode}] ${entry.speaker}` : entry.speaker;
+             assignedVoices.push(`${label}: ${voiceName}`);
           }
         });
         voiceSummary.textContent = assignedVoices.length > 0 
@@ -1059,20 +1328,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       let missingSpeakers = new Set();
       let missingSpeakerKeys = new Set();
-      let missingEntries = [];
       let selectableEntries = entriesForPreview;
       if (!isSingle) {
         file.entries.forEach(entry => {
             const entryLanguageCode = getEntryLanguageCode(entry, file);
             const mappingKey = getVoiceMappingKey(entry.speaker, entryLanguageCode);
-            if (!getVoiceMappingValue(entry.speaker, entryLanguageCode).trim()) {
+             if (!getMappingVoiceName(getVoiceMappingValue(entry.speaker, entryLanguageCode))) {
                 missingSpeakers.add(entry.speaker);
                 missingSpeakerKeys.add(mappingKey);
             }
         });
-        missingEntries = file.entries.filter(e => missingSpeakerKeys.has(getVoiceMappingKey(e.speaker, getEntryLanguageCode(e, file))));
         selectableEntries = file.entries.filter(e => !missingSpeakerKeys.has(getVoiceMappingKey(e.speaker, getEntryLanguageCode(e, file))));
-        missingEntries.forEach(e => file.excludedIds.add(e.id));
       }
 
       const allSelectableSelected = selectableEntries.length > 0 && selectableEntries.every(e => !file.excludedIds.has(e.id));
@@ -1087,9 +1353,6 @@ document.addEventListener('DOMContentLoaded', async () => {
                 selectableEntries.forEach(e => file.excludedIds.add(e.id));
             } else {
                 selectableEntries.forEach(e => file.excludedIds.delete(e.id));
-            }
-            if (!isSingle) {
-                missingEntries.forEach(e => file.excludedIds.add(e.id));
             }
             renderBatchFilesList(isSingle ? 'single' : 'multi');
             saveBatchFiles();
@@ -1432,10 +1695,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       const input = document.createElement('input');
       input.className = 'voice-mapping-input';
       input.placeholder = cachedSiteVoices.length ? 'Выберите голос из My Voices...' : 'Сначала нажмите «Обновить»';
-      input.value = currentValue;
+      input.value = getMappingVoiceName(currentValue);
       input.setAttribute('list', datalistId);
       if (autoMatchedVoice && !currentValue) {
-          input.placeholder = `Автоподбор: ${autoMatchedVoice}`;
+          input.placeholder = `Автоподбор: ${getMappingVoiceName(autoMatchedVoice)}`;
       }
 
       const controls = document.createElement('div');
@@ -1443,9 +1706,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       const dataList = document.createElement('datalist');
       dataList.id = datalistId;
-      cachedSiteVoices.forEach((voiceName) => {
+      cachedSiteVoices.forEach((voice) => {
           const option = document.createElement('option');
-          option.value = voiceName;
+          option.value = voice.voiceName;
           dataList.appendChild(option);
       });
 
@@ -1522,8 +1785,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       // Формируем заголовок с Voice ID если доступен
       let headerHTML;
       if (showSpeaker) {
-        const voiceId = voiceMap && voiceMap[entry.speaker] ? voiceMap[entry.speaker] : '';
-        const voiceDisplay = voiceId ? `<span style="color:var(--accent-green); font-size:10px;">(${voiceId})</span>` : '';
+        const mapping = voiceMap && voiceMap[entry.speaker] ? voiceMap[entry.speaker] : '';
+        const voiceName = getMappingVoiceName(mapping);
+        const voiceDisplay = voiceName ? `<span style="color:var(--accent-green); font-size:10px;">(${voiceName})</span>` : '';
         headerHTML = `<span style="color:var(--accent-blue)">${entry.speaker}</span> ${voiceDisplay} <span style="opacity:0.7">#${indexLabel}</span>`;
       } else {
         headerHTML = `<span>#${indexLabel}</span>`;
@@ -1706,6 +1970,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       
       const activeTabId = await getMinimaxTabId();
       if (!activeTabId) return showStatus('Откройте MiniMax TTS', 'error');
+      try {
+          await preflightQueueVoices(batchJobs, activeTabId);
+          await preflightGenerationCredit(batchJobs, activeTabId);
+      } catch (error) {
+          return showStatus(error.message, 'error');
+      }
       const longTextCount = getLongTextCount(batchJobs);
       if (longTextCount > 0) showStatus(`Отправляю Long Text: ${longTextCount}...`, 'info');
       const response = await chrome.runtime.sendMessage({
@@ -1720,7 +1990,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       if (response.regularStarted) setRunningState();
       if (response.regularStarted) {
-          showStatus(`Запущен пакет: ${batchJobs.length} файлов`, 'success');
+          if (response.longTextFailed) {
+              showStatus(
+                  `Regular запущен, Long Text не отправлено: ${response.longTextFailed}`,
+                  'error'
+              );
+          } else {
+              showStatus(`Запущен пакет: ${batchJobs.length} файлов`, 'success');
+          }
       } else {
           resetUI();
           showStatus(`Long Text отправлен: ${response.longTextSubmitted || 0}`, response.longTextFailed ? 'error' : 'success');
@@ -1751,7 +2028,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           
           const missingMap = new Map();
           queue.forEach((entry) => {
-              if (entry.voiceId) return;
+               if (entry.voiceId || entry.voiceName) return;
               const key = getVoiceMappingKey(entry.speaker, entry.languageCode || '');
               if (!missingMap.has(key)) {
                   const label = entry.languageCode ? `[${entry.languageCode}] ${entry.speaker}` : entry.speaker;
@@ -1759,7 +2036,9 @@ document.addEventListener('DOMContentLoaded', async () => {
               }
           });
           const missing = [...missingMap.values()];
-          if (missing.length && !confirm(`Файл "${file.name}"\nНет голоса для: ${missing.join(', ')}. Продолжить?`)) return;
+          if (missing.length) {
+              return showStatus(`Запуск заблокирован. Нет голоса для: ${missing.join(', ')}`, 'error');
+          }
 
           batchJobs.push({ queue, mode: 'multi', scriptName });
       }
@@ -1767,6 +2046,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (batchJobs.length === 0) return showStatus('Очередь пуста', 'error');
       const activeTabId = await getMinimaxTabId();
       if (!activeTabId) return showStatus('Откройте MiniMax TTS', 'error');
+      try {
+          const mappingInspection = await inspectVoiceMappingPlan();
+          if (!mappingInspection.valid) {
+              return showStatus('Запуск заблокирован: исправьте voice mapping', 'error');
+          }
+          await preflightQueueVoices(batchJobs, activeTabId);
+          await preflightGenerationCredit(batchJobs, activeTabId);
+      } catch (error) {
+          return showStatus(error.message, 'error');
+      }
 
       const action = parallelModeEnabled ? 'startParallelBatchProcessing' : 'startBatchProcessing';
       const longTextCount = getLongTextCount(batchJobs);
@@ -1785,6 +2074,11 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (!response.regularStarted) {
           resetUI();
           showStatus(`Long Text отправлен: ${response.longTextSubmitted || 0}`, response.longTextFailed ? 'error' : 'success');
+      } else if (response.longTextFailed) {
+          showStatus(
+              `Regular запущен, Long Text не отправлено: ${response.longTextFailed}`,
+              'error'
+          );
       } else if (response.parallel) {
           showStatus('Запущено 2 потока', 'success');
       } else if (response.fallback) {
@@ -1842,7 +2136,8 @@ document.addEventListener('DOMContentLoaded', async () => {
               originalGlobalCounter++;
               return {
                   ...entry,
-                  voiceId: useVoiceMap ? (getVoiceMappingValue(entry.speaker, entryLanguageCode) || null) : null,
+                   voiceId: useVoiceMap ? (getMappingVoiceId(getVoiceMappingValue(entry.speaker, entryLanguageCode)) || null) : null,
+                   voiceName: useVoiceMap ? (getMappingVoiceName(getVoiceMappingValue(entry.speaker, entryLanguageCode)) || null) : null,
                   scriptName: scriptName,
                   downloadLayout,
                   languageCode: entryLanguageCode,
@@ -1851,7 +2146,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                   sourceFileBaseName,
                   sourceFileIndex,
                   originalSpeakerIndex: originalSpeakerCounters[entry.speaker],
-                  originalDownloadIndex: originalGlobalCounter
+                  originalDownloadIndex: entry.downloadIndex || originalGlobalCounter
               };
           });
 

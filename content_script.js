@@ -8,6 +8,8 @@ let currentAutomationMode = 'single';
 
 // Сохранение пропущенных записей
 let skippedEntriesBuffer = [];
+const MAX_ENTRY_ATTEMPTS = 3;
+const AUTOMATION_HEARTBEAT_MS = 45000;
 
 async function initialize() {
   try {
@@ -20,7 +22,7 @@ async function initialize() {
   }
 }
 
-initialize();
+const initializationReady = initialize();
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.extensionEnabled) {
@@ -151,27 +153,42 @@ let automation = null;
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'startAutomation') {
-    if (!extensionEnabled) {
-      sendResponse({ success: false, reason: 'disabled' });
-      return true;
-    }
-    if (!automation || !automation.isRunning) automation = new VoiceoverAutomation();
-    automation.setRunContext(request.runId || null, request.workerId || null);
-    automation.setQueue(request.queue);
-    automation.setMode(request.mode || 'single');
-    automation.setScriptName(request.scriptName || null);
-    automation.start();
-    sendResponse({ success: true });
+    initializationReady.then(() => {
+      if (!extensionEnabled) {
+        sendResponse({ success: false, reason: 'disabled' });
+        return;
+      }
+      if (automation?.isRunning) {
+        sendResponse({ success: false, reason: 'automation_already_running' });
+        return;
+      }
+      automation = new VoiceoverAutomation();
+      automation.setRunContext(request.runId || null, request.workerId || null);
+      automation.setLegacyJobId(request.legacyJobId || null);
+      automation.setQueue(request.queue);
+      automation.setMode(request.mode || 'single');
+      automation.setScriptName(request.scriptName || null);
+      automation.start();
+      sendResponse({ success: true });
+    }).catch((error) => sendResponse({ success: false, reason: error.message }));
     return true;
   }
   if (request.action === 'pauseAutomation') {
-    if (automation) automation.pause();
-    sendResponse({ success: true });
+    if (!automation?.isRunning) {
+      sendResponse({ success: false, reason: 'automation_not_running' });
+      return true;
+    }
+    automation.pause();
+    sendResponse({ success: automation.isPaused === true });
     return true;
   }
   if (request.action === 'resumeAutomation') {
-    if (automation) automation.resume();
-    sendResponse({ success: true });
+    if (!automation?.isRunning) {
+      sendResponse({ success: false, reason: 'automation_not_running' });
+      return true;
+    }
+    automation.resume();
+    sendResponse({ success: automation.isPaused === false });
     return true;
   }
   if (request.action === 'stopAutomation') {
@@ -185,6 +202,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       .catch((error) => sendResponse({ success: true, warning: error.message }));
     return true;
   }
+  if (request.action === 'cancelLongTextSubmissions') {
+    if (!automation) automation = new VoiceoverAutomation();
+    automation.longTextCancellationRequested = true;
+    sendResponse({ success: true });
+    return true;
+  }
+  if (request.action === 'resetLongTextCancellation') {
+    if (!automation) automation = new VoiceoverAutomation();
+    automation.longTextCancellationRequested = false;
+    sendResponse({ success: true });
+    return true;
+  }
   if (request.action === 'getAutomationRuntimeState') {
     sendResponse({
       success: true,
@@ -194,8 +223,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         currentIndex: automation ? automation.currentIndex : 0,
         total: automation && Array.isArray(automation.queue) ? automation.queue.length : 0,
         mode: automation?.mode || currentAutomationMode || 'single',
-        runId: automation?.runId || null,
-        workerId: automation?.workerId || null
+          runId: automation?.runId || null,
+          workerId: automation?.workerId || null,
+          legacyJobId: automation?.legacyJobId || null,
+        queue: automation?.queue?.map((entry) => ({
+          id: entry.id,
+          status: entry.status,
+          error: entry.error || null,
+          submissionRejected: entry.submissionRejected === true,
+          downloadConfirmed: entry.downloadConfirmed === true
+        })) || []
       }
     });
     return true;
@@ -217,8 +254,26 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
   if (request.action === 'prepareParallelWorker') {
     if (!automation) automation = new VoiceoverAutomation();
-    automation.prepareParallelWorker(request.voiceId || '', request.language || 'Auto')
+    automation.prepareParallelWorker(
+      request.voiceName || request.voiceId || '',
+      request.voiceId || '',
+      request.language || 'Auto'
+    )
       .then(() => sendResponse({ success: true }))
+      .catch((error) => sendResponse({ success: false, reason: error.message }));
+    return true;
+  }
+  if (request.action === 'verifyVoiceSwitch') {
+    if (!automation) automation = new VoiceoverAutomation();
+    automation.switchVoice(request.voiceName || request.voiceId || '', request.voiceId || '')
+      .then(async () => {
+        const state = await automation.callBridge('getDirectTtsReadyState', '', request.voiceId || '');
+        sendResponse({
+          success: String(state?.voiceId || '') === String(request.voiceId || ''),
+          expectedVoiceId: String(request.voiceId || ''),
+          activeVoiceId: String(state?.voiceId || '')
+        });
+      })
       .catch((error) => sendResponse({ success: false, reason: error.message }));
     return true;
   }
@@ -235,11 +290,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
   if (request.action === 'queryLongTextHistory') {
     if (!automation) automation = new VoiceoverAutomation();
-    if (automation.isRunning) {
-      sendResponse({ success: false, reason: 'automation_running' });
-      return true;
-    }
-    automation.queryLongTextHistory(request.tasks || [])
+    automation.queryLongTextHistory(request.tasks || [], request.timeout || 12000)
       .then((result) => sendResponse({ success: true, ...result }))
       .catch((error) => sendResponse({ success: false, reason: error.message }));
     return true;
@@ -251,9 +302,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       .catch((error) => sendResponse({ success: false, reason: error.message }));
     return true;
   }
-  if (request.action === 'listVoicesFromUi') {
+  if (request.action === 'listMyVoices') {
     if (!automation) automation = new VoiceoverAutomation();
-    automation.listVoicesFromUi(request.prefix || '').then((result) => {
+    automation.listMyVoices().then((result) => {
       sendResponse({
         success: !!result?.ok,
         voices: Array.isArray(result?.voices) ? result.voices : [],
@@ -263,9 +314,62 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       sendResponse({
         success: false,
         voices: [],
-        reason: error?.message || 'list_voices_from_ui_failed'
+        reason: error?.message || 'list_my_voices_failed'
       });
     });
+    return true;
+  }
+  if (request.action === 'inspectVoiceMappingPlan') {
+    if (automation?.isRunning) {
+      sendResponse({ success: false, reason: 'automation_running' });
+      return true;
+    }
+    if (!automation) automation = new VoiceoverAutomation();
+    automation.inspectVoiceMappingPlan(request.plan || {})
+      .then((result) => sendResponse({ success: true, ...result }))
+      .catch((error) => sendResponse({ success: false, reason: error?.message || 'mapping_inspection_failed' }));
+    return true;
+  }
+  if (request.action === 'getGenerationCredit') {
+    if (!automation) automation = new VoiceoverAutomation();
+    automation.getGenerationCredit(request.requestedCharacters || 0).then((result) => {
+      sendResponse({ success: !!result?.ok, ...result });
+    }).catch((error) => {
+      sendResponse({ success: false, reason: error?.message || 'generation_credit_failed' });
+    });
+    return true;
+  }
+  if (request.action === 'getDirectTtsCapability') {
+    if (!automation) automation = new VoiceoverAutomation();
+    automation.getDirectTtsCapability().then((result) => {
+      sendResponse({ success: !!result?.ok, ...result });
+    }).catch((error) => {
+      sendResponse({ success: false, reason: error?.message || 'direct_tts_capability_failed' });
+    });
+    return true;
+  }
+  if (request.action === 'prepareDirectProbeText') {
+    if (!automation) automation = new VoiceoverAutomation();
+    const text = String(request.text || 'Safe blocked direct transport probe.');
+    automation.setLongTextMode(false)
+      .then(() => automation.callBridge('clearTextContent'))
+      .then(() => automation.callBridge('insertText', text))
+      .then((result) => sendResponse({ success: !!result?.ok, textLength: text.length, reason: result?.reason || null }))
+      .catch((error) => sendResponse({ success: false, reason: error.message }));
+    return true;
+  }
+  if (request.action === 'voiceCleanupPreview') {
+    if (!automation) automation = new VoiceoverAutomation();
+    automation.getVoiceCleanupPreview(request.protectedVoiceNames || [], request.count || 20, request.protectedVoiceIds || [])
+      .then((result) => sendResponse({ success: !!result?.ok, ...result }))
+      .catch((error) => sendResponse({ success: false, reason: error.message }));
+    return true;
+  }
+  if (request.action === 'voiceCleanupDelete') {
+    if (!automation) automation = new VoiceoverAutomation();
+    automation.deleteVoiceCleanupCandidates(request.candidates || [], request.protectedVoiceNames || [], request.protectedVoiceIds || [])
+      .then((result) => sendResponse({ success: !!result?.ok, ...result }))
+      .catch((error) => sendResponse({ success: false, reason: error.message }));
     return true;
   }
 });
@@ -282,11 +386,14 @@ class VoiceoverAutomation {
         this.scriptName = null;
         this.runId = null;
         this.workerId = null;
+        this.legacyJobId = null;
         this.skippedEntries = []; 
+        this.heartbeatTimer = null;
+        this.longTextCancellationRequested = false;
         
         this.selectors = {
             textarea: '[data-slate-editor="true"]',
-            switchVoiceBtnXPath: '//div[contains(@class, "flex") and .//path[starts-with(@d, "M5.24492 3.34774")]',
+            switchVoiceBtnXPath: '//div[contains(@class, "flex") and .//path[starts-with(@d, "M5.24492 3.34774")]]',
             searchVoiceInput: 'input[placeholder*="Search"], input[placeholder*="voices"], input[placeholder*="Voices"]',
             useVoiceBtnXPath: '//div[contains(text(), "Use") and contains(@class, "ant-btn")]',
             closeModalBtnXPath: '//span[contains(@class, "anticon-close")]',
@@ -310,12 +417,29 @@ class VoiceoverAutomation {
         this.workerId = workerId;
     }
 
-    async prepareParallelWorker(voiceId, language) {
+    setLegacyJobId(legacyJobId) {
+        this.legacyJobId = legacyJobId;
+    }
+
+    async prepareParallelWorker(voiceName, voiceId, language) {
         const editor = await this.waitForElement('[data-slate-editor="true"]', 5000);
         const generateButton = await this.findGenerateButton();
         if (!editor || !generateButton) throw new Error('MiniMax editor is not ready');
-        if (voiceId) await this.switchVoice(voiceId);
+        if (voiceName || voiceId) await this.switchVoice(voiceName || voiceId, voiceId);
         if (language) await this.ensureLanguage(language);
+    }
+
+    startHeartbeat() {
+        this.stopHeartbeat();
+        this.heartbeatTimer = setInterval(() => {
+            if (this.isRunning && !this.isPaused) this.notifyProgress();
+        }, AUTOMATION_HEARTBEAT_MS);
+    }
+
+    stopHeartbeat() {
+        if (!this.heartbeatTimer) return;
+        clearInterval(this.heartbeatTimer);
+        this.heartbeatTimer = null;
     }
 
     getPageTab(label) {
@@ -370,23 +494,59 @@ class VoiceoverAutomation {
         return null;
     }
 
-    async queryLongTextHistory(tasks) {
-        const installResult = await this.callBridge('ensureLongTextHistoryCapture');
-        if (!installResult?.ok) throw new Error(installResult?.reason || 'history_capture_install_failed');
-        const resetResult = await this.callBridge('resetLongTextHistoryCapture');
-        if (!resetResult?.ok) throw new Error(resetResult?.reason || 'history_capture_reset_failed');
-
-        const historyTab = this.getPageTab('History');
-        if (!historyTab) throw new Error('History tab not found');
-        if (historyTab.getAttribute('aria-selected') === 'true') {
-            await this.openPageTab('Settings');
-        }
-        historyTab.click();
-
-        const result = await this.callBridge('consumeLongTextHistory', tasks, 12000);
-        await this.openPageTab('Settings');
+    async queryLongTextHistory(tasks, timeout = 12000) {
+        const result = await this.callBridge('consumeLongTextHistory', tasks, timeout);
         if (!result?.ok) throw new Error(result?.reason || 'history_query_failed');
         return result;
+    }
+
+    async getVoiceCleanupPreview(protectedVoiceNames, count, protectedVoiceIds) {
+        return this.callBridge('getVoiceCleanupPreview', protectedVoiceNames, count, protectedVoiceIds);
+    }
+
+    async deleteVoiceCleanupCandidates(candidates, protectedVoiceNames, protectedVoiceIds) {
+        return this.callBridge('deleteVoiceCleanupCandidates', candidates, protectedVoiceNames, protectedVoiceIds);
+    }
+
+    async listMyVoices() {
+        return this.callBridge('listMyVoices');
+    }
+
+    async inspectVoiceMappingPlan(plan) {
+        const result = await this.listMyVoices();
+        if (!result?.ok) throw new Error(result?.reason || 'list_my_voices_failed');
+        return VoiceMappingResolver.inspectPlan(plan, result.voices || []);
+    }
+
+    async getGenerationCredit(requestedCharacters) {
+        return this.callBridge('getGenerationCredit', requestedCharacters);
+    }
+
+    async getDirectTtsCapability() {
+        return this.callBridge('getDirectTtsCapability');
+    }
+
+    async waitForDirectTtsReady(expectedText, expectedVoiceId = '', expectedLanguage = '', timeout = 5000) {
+        const startedAt = Date.now();
+        let stableLanguage = '';
+        let stableCount = 0;
+        while (Date.now() - startedAt < timeout) {
+            const state = await this.callBridge(
+                'getDirectTtsReadyState',
+                expectedText,
+                expectedVoiceId,
+                expectedLanguage
+            );
+            if (state?.ok && state.language === stableLanguage) {
+                stableCount += 1;
+                if (stableCount >= 2) return state;
+            } else {
+                stableLanguage = state?.ok ? state.language : '';
+                stableCount = state?.ok ? 1 : 0;
+            }
+            await this.sleep(300);
+        }
+        throw new Error('Direct TTS state did not stabilize');
     }
 
     async submitLongText(task) {
@@ -396,7 +556,8 @@ class VoiceoverAutomation {
         }
 
         await this.openPageTab('Settings');
-        if (task.voiceId) await this.switchVoice(task.voiceId);
+        const voiceLabel = task.voiceName || task.voiceId;
+        if (voiceLabel) await this.switchVoice(voiceLabel, task.voiceId || '');
         if (task.language) await this.ensureLanguage(task.language);
         await this.setLongTextMode(true);
 
@@ -406,14 +567,100 @@ class VoiceoverAutomation {
 
         const generateButton = await this.waitForGenerateButtonReady(30000);
         if (!generateButton) throw new Error('Generate button not active for Long Text');
-        generateButton.click();
-
-        const proceedButton = await this.waitForVisibleButtonByText('Proceed', 10000);
-        if (!proceedButton) throw new Error('Long Text Proceed button not found');
+        this.throwIfLongTextCancelled();
+        const readyState = await this.waitForDirectTtsReady(
+            task.text,
+            task.voiceId || '',
+            task.language || ''
+        );
+        this.throwIfLongTextCancelled();
         const submittedAt = Date.now();
-        proceedButton.click();
-        await this.sleep(1000);
-        return { submittedAt };
+        const reservation = await chrome.runtime.sendMessage({
+                action: 'reserveLongTextSubmission',
+                localId: task.localId,
+                reservedAt: submittedAt,
+                transport: 'direct'
+            });
+        if (!reservation?.success) {
+                throw new Error(`Long Text reservation failed: ${reservation?.reason || 'unknown error'}`);
+        }
+        if (this.longTextCancellationRequested) {
+                await this.releaseLongTextReservation(task.localId);
+                this.throwIfLongTextCancelled();
+        }
+        const dispatchMarker = await chrome.runtime.sendMessage({
+                action: 'markLongTextDispatched',
+                localId: task.localId,
+                dispatchedAt: submittedAt
+        });
+        if (!dispatchMarker?.success) {
+                await this.releaseLongTextReservation(task.localId);
+                throw new Error(`Long Text dispatch marker failed: ${dispatchMarker?.reason || 'unknown error'}`);
+        }
+        if (this.longTextCancellationRequested) {
+                await this.releaseLongTextReservation(task.localId);
+                this.throwIfLongTextCancelled();
+        }
+        const directResult = await this.callDirectBridge(
+                'submitDirectLongText',
+                task.text,
+                readyState.signature,
+                task.voiceId || ''
+            );
+        await chrome.storage.local.set({
+                directTtsLastResult: {
+                    mode: 'long',
+                    recordedAt: Date.now(),
+                    ok: directResult?.ok === true,
+                    disposition: directResult?.disposition || 'bridge_failed',
+                    category: directResult?.category || '',
+                    code: directResult?.code ?? null,
+                    responseMeta: directResult?.responseMeta || null
+                }
+        });
+        if (directResult?.ok) {
+                return {
+                    submittedAt,
+                    transport: 'direct',
+                    disposition: directResult.disposition,
+                    msgId: directResult.msgId || ''
+                };
+        }
+        if (directResult?.disposition === 'rejected') {
+                await chrome.runtime.sendMessage({
+                    action: 'markLongTextRejected',
+                    localId: task.localId,
+                    reason: directResult?.reason || directResult?.disposition || 'unknown'
+                });
+                throw new Error(`Direct Long Text rejected: ${directResult?.reason || directResult?.disposition || 'unknown'}`);
+        }
+        if (!['not_sent', 'not_invoked'].includes(directResult?.disposition)) {
+                throw new Error(`Direct Long Text may have been accepted: ${directResult?.reason || directResult?.disposition || 'unknown'}`);
+        }
+        const release = await chrome.runtime.sendMessage({
+                action: 'releaseLongTextReservation',
+                localId: task.localId
+            });
+        if (!release?.success) {
+                throw new Error(`Long Text reservation release failed: ${release?.reason || 'unknown error'}`);
+        }
+        throw new Error(`Direct Long Text was not sent: ${directResult?.reason || directResult?.disposition || 'unknown'}`);
+    }
+
+    throwIfLongTextCancelled() {
+        if (this.longTextCancellationRequested) {
+            throw new Error('Long Text submission stopped before dispatch');
+        }
+    }
+
+    async releaseLongTextReservation(localId) {
+        const release = await chrome.runtime.sendMessage({
+            action: 'releaseLongTextReservation',
+            localId
+        });
+        if (!release?.success) {
+            throw new Error(`Long Text reservation release failed: ${release?.reason || 'unknown error'}`);
+        }
     }
 
     async restoreRegularTextMode() {
@@ -697,11 +944,17 @@ class VoiceoverAutomation {
                 removeStealthStyle = this.installStealthVoiceModalStyle();
                 switchBtn.click();
                 openedByScript = true;
-                await this.sleep(900);
-                modal = document.querySelector(modalSelector);
+                const modalStartedAt = Date.now();
+                while (Date.now() - modalStartedAt < 5000) {
+                    modal = document.querySelector(modalSelector);
+                    // The temporary stealth style intentionally sets opacity to zero.
+                    // Once this method opened the modal itself, its presence is enough.
+                    if (modal && (openedByScript || isVisibleElement(modal))) break;
+                    await this.sleep(100);
+                }
             }
 
-            if (!modal || !isVisibleElement(modal)) {
+            if (!modal || (!openedByScript && !isVisibleElement(modal))) {
                 return { ok: false, reason: 'voice_modal_not_visible', voices: [] };
             }
 
@@ -773,8 +1026,10 @@ class VoiceoverAutomation {
         this.isRunning = true;
         this.isPaused = false;
         this.isStopped = false;
+        this.startHeartbeat();
         this.notifyProgress();
         this.log('Automation STARTED');
+        let terminalError = null;
         try {
             this.log('Ensuring Long Text mode is disabled...');
             await this.setLongTextMode(false);
@@ -782,6 +1037,7 @@ class VoiceoverAutomation {
             this.log('Regular Text mode is ready');
             await this.processQueue();
         } catch (error) {
+            terminalError = error;
             const entry = this.queue[this.currentIndex];
             if (entry && entry.status !== 'completed') {
                 entry.status = 'error';
@@ -790,14 +1046,20 @@ class VoiceoverAutomation {
             this.error('Fatal error in processQueue', error);
         } finally {
             this.isRunning = false;
-            if (!this.isStopped) this.notifyComplete();
+            this.stopHeartbeat();
+            if (!this.isStopped) this.notifyComplete(terminalError);
             this.log('Automation FINISHED');
         }
     }
 
     pause() { if (this.isRunning) { this.isPaused = true; this.notifyPause(); this.log('PAUSED'); } }
     resume() { if (this.isRunning && this.isPaused) { this.isPaused = false; this.notifyResume(); this.log('RESUMED'); } }
-    stop() { this.isRunning = false; this.isPaused = false; this.isStopped = true; this.notifyStop(); this.log('STOPPED'); }
+    stop() { this.isRunning = false; this.isPaused = false; this.isStopped = true; this.stopHeartbeat(); this.notifyStop(); this.log('STOPPED'); }
+
+    async waitForDispatchAllowed() {
+        while (this.isPaused && this.isRunning) await this.sleep(200);
+        if (!this.isRunning) throw new Error('Stopped before paid submission dispatch');
+    }
 
     async processQueue() {
         while (this.currentIndex < this.queue.length) {
@@ -853,35 +1115,48 @@ class VoiceoverAutomation {
                 await this.sleep(1000);
             } catch (error) {
                 this.error(`Failed processing entry #${this.currentIndex}`, error);
-                entry.attempt++;
-                if (entry.attempt < 2 && this.isRunning && !this.runId) {
-                    this.log('Retrying...');
+                entry.attempt = Number(entry.attempt || 0) + 1;
+                if (!entry.paidSubmissionStarted
+                    && !entry.submissionRejected
+                    && entry.attempt < MAX_ENTRY_ATTEMPTS
+                    && this.isRunning) {
+                    this.log(`Retrying entry (${entry.attempt + 1}/${MAX_ENTRY_ATTEMPTS})...`);
+                    this.notifyProgress();
                     await this.sleep(2000);
                     continue;
                 }
                 entry.status = 'error';
-                entry.error = error.message;
+                entry.error = entry.paidSubmissionStarted
+                    ? `Generation may have been accepted; not retried: ${error.message}`
+                    : error.message;
+                this.notifyProgress();
                 this.currentIndex++;
+                throw new Error(entry.error);
             }
         }
     }
 
     async processEntry(entry) {
+        const capability = await this.getDirectTtsCapability();
+        if (!capability?.ok) {
+            throw new Error(`MiniMax direct TTS is incompatible: ${capability?.reason || 'direct_tts_capability_unavailable'}`);
+        }
         // Проверяем флаг остановки перед каждой операцией
         if (!this.isRunning) {
             this.log('STOP requested, aborting processEntry');
             return;
         }
         
-        if (entry.voiceId) {
-            this.log(`Switching voice to: ${entry.voiceId}`);
+        const voiceLabel = entry.voiceName || entry.voiceId;
+        if (voiceLabel) {
+            this.log(`Switching voice to: ${voiceLabel}`);
             try {
-                await this.switchVoice(entry.voiceId);
+                await this.switchVoice(voiceLabel, entry.voiceId || '');
             }
             catch (e) {
                 // Если голос не найден - пропускаем эту реплику
                 if (String(e.message || '').toLowerCase().includes('not found')) {
-                    this.log(`Voice "${entry.voiceId}" not found, skipping entry`);
+                    this.log(`Voice "${voiceLabel}" not found, skipping entry`);
                     entry.status = 'skipped_voice_not_found';
                     this.notifyProgress();
                     return; // Выходим из processEntry, не обрабатываем эту реплику
@@ -912,6 +1187,10 @@ class VoiceoverAutomation {
 
         if (!targetEl) throw new Error('Textarea (Slate editor) not found');
 
+        // MiniMax may keep the prior entry in Slate after a generation. Clear it first
+        // so the next insert is never appended to stale content.
+        await this.clearText();
+
         // === ГЛАВНОЕ: Вставка текста (Замена всего старого на новое) ===
         await this.insertText(targetEl, entry.text);
 
@@ -929,17 +1208,11 @@ class VoiceoverAutomation {
             throw new Error('Generate button not active');
         }
 
-        const captureInstallResult = await this.callBridge('ensureAudioCaptureInstalled');
-        if (!captureInstallResult || !captureInstallResult.ok) {
-            throw new Error(`Audio capture install failed: ${captureInstallResult && captureInstallResult.reason ? captureInstallResult.reason : 'unknown reason'}`);
-        }
-        this.log(captureInstallResult.alreadyInstalled ? 'Audio capture installed (already active)' : 'Audio capture installed');
-
-        const captureResetResult = await this.callBridge('resetAudioCaptureSession');
-        if (!captureResetResult || !captureResetResult.ok) {
-            throw new Error(`Audio capture reset failed: ${captureResetResult && captureResetResult.reason ? captureResetResult.reason : 'unknown reason'}`);
-        }
-        this.log('Audio capture session reset');
+        const directReadyState = await this.waitForDirectTtsReady(
+            entry.text,
+            entry.voiceId || '',
+            entry.language || ''
+        );
 
         const historyInstallResult = await this.callBridge('ensureLongTextHistoryCapture');
         if (!historyInstallResult?.ok) {
@@ -951,61 +1224,158 @@ class VoiceoverAutomation {
         }
 
         const submittedAt = Date.now();
-        generateBtn.click();
-        this.log('Clicked Generate');
-
-        if (!this.isRunning) {
-            this.log('STOP requested, aborting after generate click');
-            return;
-        }
-
-        this.log('Waiting for generated audio in History...');
-
-        if (!this.isRunning) {
-            this.log('STOP requested, aborting before download');
-            return;
-        }
-
-        const fileNameBase = entry.originalTag || entry.speaker || 'dictor';
-        const historyResult = await this.callBridge('consumeGeneratedAudioHistory', {
+        const baselineHistory = await this.queryLongTextHistory([], 30000);
+        const baselineAudioIds = Array.isArray(baselineHistory.audioIds) ? baselineHistory.audioIds : [];
+        await this.waitForDispatchAllowed();
+        let submissionId = crypto.randomUUID();
+        entry.paidSubmissionStarted = true;
+        entry.submittedAt = submittedAt;
+        entry.submissionId = submissionId;
+        const durableReservation = await chrome.runtime.sendMessage({
+            action: 'reserveRegularSubmission',
+            submissionId,
+            submittedAt,
+            runId: this.runId,
+            workerId: this.workerId,
+            parallelKey: entry._parallelKey || null,
             text: entry.text,
             voiceId: entry.voiceId || '',
-            submittedAt
-        }, 60000);
-        if (!this.isRunning) {
-            this.log('STOP requested, discarding generated audio');
-            return;
+            voiceName: entry.voiceName || '',
+            transport: 'direct',
+            baselineAudioIds,
+            speakerName: entry.speaker || entry.originalTag || '',
+            scriptName: entry.scriptName || this.scriptName || null,
+            downloadIndex: entry.downloadIndex || entry.speakerIndex || null,
+            downloadLayout: entry.downloadLayout || null,
+            sourceFileName: entry.sourceFileName || null,
+            sourceFileBaseName: entry.sourceFileBaseName || null
+        });
+        if (!durableReservation?.success) {
+            entry.paidSubmissionStarted = false;
+            throw new Error(`Paid submission ledger failed: ${durableReservation?.reason || 'unknown error'}`);
         }
-        const historyRecord = historyResult?.record;
+        if (this.runId) {
+            const reservation = await chrome.runtime.sendMessage({
+                action: 'reservePaidSubmission',
+                runId: this.runId,
+                workerId: this.workerId,
+                parallelKey: entry._parallelKey,
+                submittedAt
+            });
+            if (!reservation?.success) {
+                entry.paidSubmissionStarted = false;
+                await chrome.runtime.sendMessage({
+                    action: 'completeRegularSubmission',
+                    submissionId
+                });
+                throw new Error(`Paid submission reservation failed: ${reservation?.reason || 'unknown error'}`);
+            }
+        }
+        this.notifyProgress();
+        try {
+            await this.waitForDispatchAllowed();
+        } catch (error) {
+            await this.rollbackUndispatchedSubmission(entry, submissionId);
+            throw error;
+        }
+        let directResult = null;
+            const dispatchMarker = await chrome.runtime.sendMessage({
+                action: 'markRegularSubmissionSent',
+                submissionId,
+                sentAt: Date.now()
+            });
+            if (!dispatchMarker?.success) {
+                await this.rollbackUndispatchedSubmission(entry, submissionId);
+                throw new Error(`Paid submission dispatch marker failed: ${dispatchMarker?.reason || 'unknown error'}`);
+            }
+            try {
+                await this.waitForDispatchAllowed();
+            } catch (error) {
+                await this.rollbackUndispatchedSubmission(entry, submissionId);
+                throw error;
+            }
+            directResult = await this.callDirectBridge(
+                'generateDirectAudio',
+                entry.text,
+                directReadyState.signature,
+                entry.voiceId || ''
+            );
+            await chrome.storage.local.set({
+                directTtsLastResult: {
+                    mode: 'regular',
+                    recordedAt: Date.now(),
+                    ok: directResult?.ok === true,
+                    disposition: directResult?.disposition || 'bridge_failed',
+                    category: directResult?.category || '',
+                    code: directResult?.code ?? null,
+                    responseMeta: directResult?.responseMeta || null
+                }
+            });
+            if (!directResult?.ok && ['not_sent', 'not_invoked'].includes(directResult?.disposition)) {
+                entry.paidSubmissionStarted = false;
+                const ledgerRelease = await chrome.runtime.sendMessage({
+                    action: 'completeRegularSubmission',
+                    submissionId
+                });
+                if (!ledgerRelease?.success) {
+                    throw new Error(`Paid submission ledger release failed: ${ledgerRelease?.reason || 'unknown error'}`);
+                }
+                if (this.runId) {
+                    const release = await chrome.runtime.sendMessage({
+                        action: 'releasePaidSubmission',
+                        runId: this.runId,
+                        workerId: this.workerId,
+                        parallelKey: entry._parallelKey
+                    });
+                    if (!release?.success) {
+                        throw new Error(`Paid submission release failed: ${release?.reason || 'unknown error'}`);
+                    }
+                }
+                throw new Error(`Direct generation was not sent: ${directResult?.reason || directResult?.disposition || 'unknown'}`);
+            } else if (!directResult?.ok) {
+                if (directResult?.disposition === 'rejected') {
+                    const ledgerCleanup = await chrome.runtime.sendMessage({
+                        action: 'completeRegularSubmission',
+                        submissionId
+                    });
+                    let parallelCleanup = { success: true };
+                    if (this.runId) {
+                        parallelCleanup = await chrome.runtime.sendMessage({
+                            action: 'releasePaidSubmission',
+                            runId: this.runId,
+                            workerId: this.workerId,
+                            parallelKey: entry._parallelKey
+                        });
+                    }
+                    if (!ledgerCleanup?.success || !parallelCleanup?.success) {
+                        throw new Error('Direct rejection cleanup failed; reconciliation required');
+                    }
+                    entry.paidSubmissionStarted = false;
+                    entry.submissionRejected = true;
+                }
+                throw new Error(`Direct generation may have been accepted: ${directResult?.reason || directResult?.disposition || 'unknown'}`);
+            } else {
+                this.log(`Direct audio completed (${directResult.size || 0} bytes)`);
+            }
+
+        const fileNameBase = entry.originalTag || entry.speaker || 'dictor';
         let downloadRes;
 
-        if (historyRecord?.status === 0 && historyRecord.audioUrl) {
-            this.log(`Audio matched in History: ${historyRecord.audioId}`);
-            downloadRes = await chrome.runtime.sendMessage({
-                action: 'downloadFile',
-                url: historyRecord.audioUrl,
-                forceIndex: entry.downloadIndex || entry.speakerIndex || null,
-                forceSpeaker: entry.speaker || fileNameBase,
-                scriptName: entry.scriptName || null,
-                downloadLayout: entry.downloadLayout || null,
-                sourceFileName: entry.sourceFileName || null,
-                sourceFileBaseName: entry.sourceFileBaseName || null
-            });
-        } else {
-            this.log('History match unavailable, falling back to MediaSource capture');
-            const captureResult = await this.getCapturedAudioData(this.runId ? 120000 : 180000);
-            this.log(`Audio captured via ${captureResult.source || 'unknown'} (${captureResult.size || 0} bytes)`);
+        if (directResult?.ok && directResult.dataUrl) {
             downloadRes = await chrome.runtime.sendMessage({
                 action: 'downloadAudioData',
-                dataUrl: captureResult.dataUrl,
+                dataUrl: directResult.dataUrl,
                 voiceName: fileNameBase,
                 scriptName: entry.scriptName || null,
                 forceIndex: entry.downloadIndex || entry.speakerIndex || null,
                 speakerName: entry.speaker || null,
                 downloadLayout: entry.downloadLayout || null,
                 sourceFileName: entry.sourceFileName || null,
-                sourceFileBaseName: entry.sourceFileBaseName || null
+                sourceFileBaseName: entry.sourceFileBaseName || null,
+                submissionId
             });
+        } else {
+            throw new Error('Direct generation returned no downloadable audio');
         }
         if (!downloadRes || !downloadRes.success) {
             throw new Error(`Audio download failed: ${downloadRes && downloadRes.reason ? downloadRes.reason : 'unknown reason'}`);
@@ -1013,22 +1383,37 @@ class VoiceoverAutomation {
         this.log(`Download started (id: ${downloadRes.downloadId || 'n/a'})`);
         this.log(`Download confirmed (index: ${downloadRes.fileNumber || 'n/a'})`);
         entry.downloadConfirmed = true;
+        const completion = await chrome.runtime.sendMessage({
+            action: 'completeRegularSubmission',
+            submissionId
+        });
+        if (!completion?.success) {
+            throw new Error(`Paid submission completion failed: ${completion?.reason || 'unknown error'}`);
+        }
+        entry.paidSubmissionStarted = false;
         if (this.runId) this.notifyProgress();
 
-        this.log('Waiting for MiniMax UI to settle...');
-        generateBtn = await this.waitForGenerateButtonReady(10000);
-        if (!generateBtn) {
-            this.log('MiniMax UI still busy after final signal, waiting grace period...');
-            generateBtn = await this.waitForGenerateButtonReady(10000);
-            if (!generateBtn) {
-                throw new Error('MiniMax UI did not settle after final signal');
-            }
-        }
-        this.log('UI settled, proceeding');
-
-          await this.sleep(1500);
-          // Очистка в конце, чтобы подготовить почву (но insertText тоже очистит)
         await this.clearText();
+    }
+
+    async rollbackUndispatchedSubmission(entry, submissionId) {
+        const ledgerCleanup = await chrome.runtime.sendMessage({
+            action: 'completeRegularSubmission',
+            submissionId
+        });
+        let parallelCleanup = { success: true };
+        if (this.runId) {
+            parallelCleanup = await chrome.runtime.sendMessage({
+                action: 'releasePaidSubmission',
+                runId: this.runId,
+                workerId: this.workerId,
+                parallelKey: entry._parallelKey
+            });
+        }
+        if (!ledgerCleanup?.success || !parallelCleanup?.success) {
+            throw new Error('Pre-dispatch rollback failed; reconciliation required');
+        }
+        entry.paidSubmissionStarted = false;
     }
 
     // ============================================
@@ -1053,14 +1438,34 @@ class VoiceoverAutomation {
         return response.result;
     }
 
-    // --- ОЧИСТКА: просто выставляем selection на всё (замена произойдёт при следующей вставке) ---
+    async callDirectBridge(action, ...args) {
+        try {
+            const response = await chrome.runtime.sendMessage({
+                action: 'executeInMainWorld',
+                method: action,
+                args
+            });
+            if (!response?.success) {
+                return { ok: false, disposition: 'accepted_unknown', reason: response?.reason || 'direct_bridge_response_failed' };
+            }
+            return response.result || { ok: false, disposition: 'accepted_unknown', reason: 'direct_bridge_empty_result' };
+        } catch (error) {
+            return { ok: false, disposition: 'accepted_unknown', reason: error?.message || 'direct_bridge_response_failed' };
+        }
+    }
+
+    // --- ОЧИСТКА Slate перед следующей репликой ---
     async clearText() {
-        this.log('🧹 Preparing editor for next insert...');
-        const ok = await this.callBridge('selectAll');
-        if (ok) {
-            this.log('   ✨ Selection set to full range.');
-        } else {
-            this.log('   ⚠️ selectAll returned false (editor empty or not found).');
+        this.log('Clearing editor before next insert...');
+        const result = await this.callBridge('clearTextContent');
+        if (!result?.ok) {
+            throw new Error(`Editor clear failed: ${result?.reason || 'unknown reason'}`);
+        }
+
+        await this.sleep(300);
+        const remainingText = await this.callBridge('getText');
+        if (String(remainingText || '').trim()) {
+            throw new Error('Editor still contains text after clear');
         }
     }
 
@@ -1107,11 +1512,11 @@ class VoiceoverAutomation {
 
     // --- Остальные методы без изменений ---
     
-    async switchVoice(targetId) {
+    async switchVoice(targetId, expectedVoiceId = '') {
         // 1. ОПТИМИЗАЦИЯ: Сначала проверяем внутреннее состояние
         if (this.currentVoiceId === targetId) {
             this.log(`Voice "${targetId}" internal state matches, skipping switch`);
-            return;
+            if (!expectedVoiceId || await this.isExpectedVoiceIdActive(expectedVoiceId)) return;
         }
 
         await this.ensureSettingsPanelOpen();
@@ -1120,7 +1525,8 @@ class VoiceoverAutomation {
         if (await this.isTargetVoiceAlreadyActive(targetId)) {
             this.log(`DOM Check: Voice "${targetId}" is already active on page.`);
             this.currentVoiceId = targetId;
-            return;
+            if (!expectedVoiceId || await this.isExpectedVoiceIdActive(expectedVoiceId)) return;
+            this.currentVoiceId = null;
         }
 
         this.log('1. Clicking voice selector...');
@@ -1202,11 +1608,20 @@ class VoiceoverAutomation {
             }
 
             if (!applied) throw new Error(`Voice ID "${targetId}" not found`);
+            if (expectedVoiceId && !await this.isExpectedVoiceIdActive(expectedVoiceId)) {
+                this.currentVoiceId = null;
+                throw new Error(`Voice "${targetId}" did not apply expected ID ${expectedVoiceId}`);
+            }
         } finally {
             if (modalOpened) {
                 this.closeVoiceModal();
             }
         }
+    }
+
+    async isExpectedVoiceIdActive(expectedVoiceId) {
+        const state = await this.callBridge('getDirectTtsReadyState', '', expectedVoiceId);
+        return String(state?.voiceId || '') === String(expectedVoiceId || '');
     }
 
     async ensureLanguage(targetLang) {
@@ -1325,7 +1740,8 @@ class VoiceoverAutomation {
             currentIndex: this.currentIndex,
             queue: this.queue,
             runId: this.runId,
-            workerId: this.workerId
+            workerId: this.workerId,
+            legacyJobId: this.legacyJobId
         }).catch(()=>{});
         chrome.runtime.sendMessage({
             action: 'updateAutomationProgress',
@@ -1343,13 +1759,17 @@ class VoiceoverAutomation {
             }
         }).catch(()=>{});
     }
-    notifyComplete() {
+    notifyComplete(error = null) {
         chrome.runtime.sendMessage({
             action: 'automationComplete',
+            success: !error,
+            unresolved: !!error && this.queue.some((entry) => entry.paidSubmissionStarted),
+            error: error?.message || null,
             completed: this.currentIndex,
             queue: this.queue,
             runId: this.runId,
-            workerId: this.workerId
+            workerId: this.workerId,
+            legacyJobId: this.legacyJobId
         }).catch(()=>{});
         chrome.runtime.sendMessage({
             action: 'updateAutomationProgress',
