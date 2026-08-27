@@ -102,7 +102,7 @@ async function findExtensionWorker(targets, { wake = true } = {}) {
 async function main() {
   const paidCommands = [
     '--start-parallel-test',
-    '--start-source-parallel-test',
+    '--start-real-parallel-canary',
     '--start-three-voice-source-parallel-test',
     '--start-fallback-source-parallel-test',
     '--start-direct-file-canary',
@@ -256,6 +256,45 @@ async function main() {
     } else {
       console.log(JSON.stringify({ count: events.length, events }, null, 2));
     }
+    return;
+  }
+
+  if (process.argv.includes('--parallel-state')) {
+    const worker = await findExtensionWorker(targets);
+    if (!worker) throw new Error('MiniMax TTS Automation service worker not found');
+    const result = await evaluate(worker, `(async () => {
+      const { parallelBatchState } = await chrome.storage.local.get('parallelBatchState');
+      const state = parallelBatchState || null;
+      return state ? {
+        phase: state.phase,
+        isRunning: state.isRunning,
+        isPaused: state.isPaused,
+        isFallingBack: state.isFallingBack,
+        runId: state.runId,
+        primaryTabId: state.primaryTabId,
+        secondaryTabId: state.secondaryTabId,
+        error: state.error || null,
+        workers: (state.workers || []).map((worker) => ({
+          workerId: worker.workerId,
+          tabId: worker.tabId,
+          currentIndex: worker.currentIndex,
+          total: worker.total,
+          status: worker.status,
+          queue: (worker.queue || []).map((entry) => ({
+            _parallelKey: entry._parallelKey,
+            id: entry.id,
+            status: entry.status,
+            downloadConfirmed: entry.downloadConfirmed === true,
+            paidSubmissionStarted: entry.paidSubmissionStarted === true,
+            submissionRejected: entry.submissionRejected === true,
+            submittedAt: Number(entry.submittedAt || 0),
+            error: entry.error || null
+          }))
+        })),
+        originalJobCounts: (state.originalJobs || []).map((job) => (job.queue || []).length)
+      } : null;
+    })()`);
+    console.log(JSON.stringify(result, null, 2));
     return;
   }
 
@@ -1702,55 +1741,84 @@ async function main() {
     return;
   }
 
-  if (process.argv.includes('--start-source-parallel-test')) {
+  if (process.argv.includes('--prepare-real-parallel-canary')) {
     if (!popup) throw new Error('MiniMax popup not found');
+    // Non-billable preflight for a fresh profile: choose the first real canary
+    // voice before the direct capability gate runs. No text is submitted.
     const result = await evaluate(popup, `(async () => {
       const [tab] = await chrome.tabs.query({ url: 'https://www.minimax.io/audio/text-to-speech*' });
       if (!tab?.id) return { success: false, reason: 'minimax_tab_not_found' };
-      const sourceFileName = 'VSLD-4440 NL Паразиты РепДок Короткая NL.md';
-      const jobs = [{
-        mode: 'multi',
-        scriptName: 'VSLD-4440 NL Паразиты РепДок Короткая NL',
-        queue: [
-          {
-            id: 'source-nl-dic-2',
-            speaker: 'ДИКТОР',
-            originalTag: 'ДИКТОР(NL) 2',
-            text: 'Wat kunt u vertellen over het overheidsprogramma?',
-            voiceId: 'mp dic NL',
-            language: 'Dutch',
-            languageCode: 'NL',
-            scriptName: 'VSLD-4440 NL Паразиты РепДок Короткая NL',
-            downloadIndex: 2,
-            speakerIndex: 2,
-            downloadLayout: 'package',
-            sourceFileName,
-            sourceFileBaseName: 'VSLD-4440 NL Паразиты РепДок Короткая NL'
-          },
-          {
-            id: 'source-nl-doc-2',
-            speaker: 'ДОКТОР',
-            originalTag: 'ДОКТОР(NL) 2',
-            text: 'Ik start samen met de overheid een programma.',
-            voiceId: 'mp doc NL',
-            language: 'Dutch',
-            languageCode: 'NL',
-            scriptName: 'VSLD-4440 NL Паразиты РепДок Короткая NL',
-            downloadIndex: 2,
-            speakerIndex: 2,
-            downloadLayout: 'package',
-            sourceFileName,
-            sourceFileBaseName: 'VSLD-4440 NL Паразиты РепДок Короткая NL'
-          }
-        ]
-      }];
-      return chrome.runtime.sendMessage({
-        action: 'startParallelBatchProcessing',
-        jobs,
-        tabId: tab.id
+      const prepared = await chrome.tabs.sendMessage(tab.id, {
+        action: 'prepareParallelWorker',
+        voiceId: '435337039483094',
+        voiceName: 'о1',
+        language: 'French'
       });
+      if (!prepared?.success) return { success: false, stage: 'prepare', prepared };
+      const capability = await chrome.tabs.sendMessage(tab.id, { action: 'getDirectTtsCapability' });
+      return { success: !!capability?.ok, prepared, capability };
     })()`);
     console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (process.argv.includes('--start-real-parallel-canary')) {
+    if (!popup) throw new Error('MiniMax popup not found');
+
+    // Deliberately use production-format source text rather than synthetic
+    // sentences. Long Text entries are excluded: this exercises only the
+    // regular direct-TTS two-worker path.
+    const sourceFileName = 'VSLL-2165 FR Похудение Thierry Casasnovas Репортер + Доктор Короткий 50%.md';
+    const sourcePath = path.join(
+      'D:/Project files/!North Union/18.08/txt/translated',
+      sourceFileName
+    );
+    const scriptName = path.basename(sourceFileName, path.extname(sourceFileName));
+    const sourceEntries = parseMarkdown(fs.readFileSync(sourcePath, 'utf8'));
+    const voiceAssignments = [
+      { voiceId: '435337039483094', voiceName: 'о1' },
+      { voiceId: '435338766659653', voiceName: 'о2' }
+    ];
+    const excludedLongTextEntries = sourceEntries.filter((entry) => entry.text.length > 5000);
+    const queue = sourceEntries
+      .filter((entry) => entry.text.length <= 5000)
+      .map((entry, index) => ({
+        ...entry,
+        ...voiceAssignments[index % voiceAssignments.length],
+        language: 'French',
+        languageCode: 'FR',
+        scriptName,
+        downloadLayout: 'package',
+        sourceFileName,
+        sourceFileBaseName: scriptName,
+        originalDownloadIndex: index + 1,
+        downloadIndex: index + 1,
+        speakerIndex: index + 1
+      }));
+
+    if (queue.length < 2) {
+      throw new Error(`Real parallel canary requires at least two regular entries, got ${queue.length}`);
+    }
+
+    const result = await evaluate(popup, `(async () => {
+      const [tab] = await chrome.tabs.query({ url: 'https://www.minimax.io/audio/text-to-speech*' });
+      if (!tab?.id) return { success: false, reason: 'minimax_tab_not_found' };
+      await chrome.storage.local.set({ directTtsEnabled: true });
+      return chrome.runtime.sendMessage({
+        action: 'startParallelBatchProcessing',
+        jobs: [{ mode: 'multi', scriptName: ${JSON.stringify(scriptName)}, queue: ${JSON.stringify(queue)} }],
+        tabId: tab.id
+      });
+    })()`, 90000);
+    console.log(JSON.stringify({
+      startedAt: Date.now(),
+      sourceFileName,
+      entryCount: queue.length,
+      excludedLongTextEntries: excludedLongTextEntries.length,
+      totalCharacters: queue.reduce((sum, entry) => sum + entry.text.length, 0),
+      voiceIds: voiceAssignments.map((voice) => voice.voiceId),
+      response: result
+    }, null, 2));
     return;
   }
 
@@ -1886,23 +1954,6 @@ async function main() {
         : null;
       await chrome.tabs.remove(secondary.id);
       return { ok: true, primary: { id: primary.id, health: primaryHealth, prepare: primaryPrepare }, secondary: { id: secondary.id, health: secondaryHealth, prepare: secondaryPrepare } };
-    })()`);
-    console.log(JSON.stringify(result, null, 2));
-    return;
-  }
-
-  if (process.argv.includes('--parallel-state')) {
-    if (!popup) throw new Error('MiniMax popup not found');
-    const result = await evaluate(popup, `(async () => {
-      const state = await chrome.storage.local.get([
-        'parallelBatchState',
-        'batchState',
-        'automationState',
-        'downloadHistory',
-        'skippedEntries'
-      ]);
-      const tabs = await chrome.tabs.query({ url: 'https://www.minimax.io/audio/text-to-speech*' });
-      return { state, tabs: tabs.map((tab) => ({ id: tab.id, status: tab.status, active: tab.active })) };
     })()`);
     console.log(JSON.stringify(result, null, 2));
     return;

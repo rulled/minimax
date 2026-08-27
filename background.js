@@ -3,6 +3,9 @@ let extensionEnabled = false;
 
 // Диагностический журнал (diag_log.js должен быть загружен первым — см. importScripts)
 importScripts('diag_log.js');
+// Pure parallel-batch helpers (buildParallelPlan, getParallelQueueSnapshot, ...).
+// Также экспортируется через module.exports для node-тестов (tests/parallel_batch.test.js).
+importScripts('parallel_batch.js');
 
 // Глобальные ошибки service worker'а — в диагностический журнал.
 self.addEventListener('error', (event) => {
@@ -2958,20 +2961,8 @@ async function pollLongTextTasks() {
   broadcastLongTextProgress();
 }
 
-function getDefaultParallelBatchState() {
-  return {
-    phase: 'idle',
-    isRunning: false,
-    isPaused: false,
-    isFallingBack: false,
-    runId: null,
-    primaryTabId: null,
-    secondaryTabId: null,
-    originalJobs: [],
-    workers: [],
-    startedAt: null
-  };
-}
+// SYNC:parallel_batch — реализация в parallel_batch.js (importScripts выше).
+const getDefaultParallelBatchState = parallel_batch.getDefaultParallelBatchState;
 
 let parallelBatchState = getDefaultParallelBatchState();
 let parallelOperationQueue = Promise.resolve();
@@ -3015,62 +3006,11 @@ function annotateParallelJobs(jobs) {
   }));
 }
 
-function buildParallelPlan(jobs) {
-  const groups = new Map();
+// SYNC:parallel_batch — реализация в parallel_batch.js.
+const buildParallelPlan = parallel_batch.buildParallelPlan;
 
-  jobs.forEach((job) => {
-    job.queue.forEach((entry) => {
-      const voiceId = String(entry.voiceId || '').trim();
-      if (!voiceId) return;
-      if (!groups.has(voiceId)) groups.set(voiceId, []);
-      groups.get(voiceId).push(entry);
-    });
-  });
-
-  const totalEntries = jobs.reduce((total, job) => total + job.queue.length, 0);
-  const mappedEntries = [...groups.values()].reduce((total, entries) => total + entries.length, 0);
-  if (mappedEntries !== totalEntries) {
-    return { ok: false, reason: 'Для двух потоков нужны голоса у всех реплик' };
-  }
-  if (groups.size < 2) {
-    return { ok: false, reason: 'Для двух потоков нужны минимум два разных голоса' };
-  }
-
-  const workers = [
-    { workerId: 'worker-1', queue: [], weight: 0 },
-    { workerId: 'worker-2', queue: [], weight: 0 }
-  ];
-  const sortedGroups = [...groups.entries()].sort((a, b) => {
-    const weightA = a[1].reduce((sum, entry) => sum + String(entry.text || '').length, 0);
-    const weightB = b[1].reduce((sum, entry) => sum + String(entry.text || '').length, 0);
-    return weightB - weightA;
-  });
-
-  sortedGroups.forEach(([, entries]) => {
-    const target = workers[0].weight <= workers[1].weight ? workers[0] : workers[1];
-    target.queue.push(...entries);
-    target.weight += entries.reduce((sum, entry) => sum + String(entry.text || '').length, 0);
-  });
-
-  if (workers.some((worker) => worker.queue.length === 0)) {
-    return { ok: false, reason: 'Не удалось равномерно разделить очередь' };
-  }
-
-  return { ok: true, workers };
-}
-
-function getParallelQueueSnapshot(queue) {
-  return (Array.isArray(queue) ? queue : []).map((entry) => ({
-    _parallelKey: entry._parallelKey,
-    id: entry.id,
-    status: entry.status || 'pending',
-    downloadConfirmed: entry.downloadConfirmed === true,
-    paidSubmissionStarted: entry.paidSubmissionStarted === true,
-    submissionRejected: entry.submissionRejected === true,
-    submittedAt: Number(entry.submittedAt || 0),
-    error: entry.error || null
-  }));
-}
+// SYNC:parallel_batch — реализация в parallel_batch.js.
+const getParallelQueueSnapshot = parallel_batch.getParallelQueueSnapshot;
 
 async function waitForParallelTab(tabId, timeoutMs = 30000) {
   const startedAt = Date.now();
@@ -3204,24 +3144,10 @@ async function broadcastParallelProgress() {
   }).catch(() => {});
 }
 
+// SYNC:parallel_batch — pure filter в buildRemainingFromWorkers (parallel_batch.js).
+// Обёртка, т.к. читает SW-состояние parallelBatchState.
 function buildRemainingParallelJobs() {
-  const protectedKeys = new Set((parallelBatchState.workers || []).flatMap((worker) => {
-    return (worker.queue || [])
-      .filter((entry) => entry.status === 'completed'
-        || entry.status === 'skipped_manual'
-        || entry.status === 'skipped_voice_not_found'
-        || entry.downloadConfirmed
-        || entry.paidSubmissionStarted
-        || entry.submissionRejected)
-      .map((entry) => entry._parallelKey);
-  }));
-
-  return (parallelBatchState.originalJobs || [])
-    .map((job) => ({
-      ...job,
-      queue: job.queue.filter((entry) => !protectedKeys.has(entry._parallelKey))
-    }))
-    .filter((job) => job.queue.length > 0);
+  return parallel_batch.buildRemainingFromWorkers(parallelBatchState.workers, parallelBatchState.originalJobs);
 }
 
 async function finishParallelBatch() {
