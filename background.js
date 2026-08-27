@@ -1059,11 +1059,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           },
 
           getDirectTtsCapability: function() {
-            var webpackRequire = null;
-            window.webpackChunk_N_E = window.webpackChunk_N_E || [];
-            window.webpackChunk_N_E.push([['minimax-direct-probe-' + Date.now()], {}, function(require) {
-              webpackRequire = require;
-            }]);
+            var webpackRequire = window.__mmWebpackRequire;
+            if (!webpackRequire) {
+              window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+              window.webpackChunk_N_E.push([['minimax-direct-probe'], {}, function(require) {
+                webpackRequire = require;
+              }]);
+              window.__mmWebpackRequire = webpackRequire || null;
+            }
             if (!webpackRequire?.m) return { ok: false, reason: 'minimax_api_runtime_missing' };
             var managerModuleId = webpackRequire.m['78544'] ? '78544' : Object.keys(webpackRequire.m).find(function(id) {
               return String(webpackRequire.m[id]).indexOf('/v1/api/audio/ws') >= 0;
@@ -1102,11 +1105,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           },
 
           getDirectTtsReadyState: function(expectedText, expectedVoiceId, expectedLanguage) {
-            var webpackRequire = null;
-            window.webpackChunk_N_E = window.webpackChunk_N_E || [];
-            window.webpackChunk_N_E.push([['minimax-direct-ready-' + Date.now()], {}, function(require) {
-              webpackRequire = require;
-            }]);
+            var webpackRequire = window.__mmWebpackRequire;
+            if (!webpackRequire) {
+              window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+              window.webpackChunk_N_E.push([['minimax-direct-ready'], {}, function(require) {
+                webpackRequire = require;
+              }]);
+              window.__mmWebpackRequire = webpackRequire || null;
+            }
             var storeModule = webpackRequire?.m?.['66021'] ? webpackRequire('66021') : null;
             var state = storeModule?.store?.getState?.();
             var text = String(state?.tts?.currentText || '');
@@ -1115,13 +1121,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               ? state?.detect?.detectedLanguage
               : settings?.language_boost;
             var normalizedExpectedLanguage = String(expectedLanguage || '').trim().toLowerCase();
+            // Когда авто-детект активен (isDetecting=true), принимаем любое состояние языка:
+            // сайт сам определит язык при отправке кадра. Это предотвращает таймаут,
+            // когда detectedLanguage остаётся пустым/"Auto" для коротких текстов.
+            var isAutoDetecting = state?.detect?.isDetecting === true;
             var languageMatches = !normalizedExpectedLanguage
+              || isAutoDetecting
               || (normalizedExpectedLanguage === 'auto'
-                ? state?.detect?.isDetecting === true
+                ? isAutoDetecting
                 : String(language || '').trim().toLowerCase() === normalizedExpectedLanguage);
-            var languageReady = normalizedExpectedLanguage === 'auto'
-              ? state?.detect?.isDetecting === true
-              : Boolean(String(language || ''));
+            var languageReady = isAutoDetecting
+              || (normalizedExpectedLanguage === 'auto'
+                ? isAutoDetecting
+                : Boolean(String(language || '')));
             var effects = state?.voice?.effects;
             var signature = JSON.stringify({
               model: String(state?.global?.constantsMap?.selectedModel || ''),
@@ -1137,7 +1149,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 format: settings?.format,
                 channel: settings?.channel
               },
-              effects: effects || null,
+              effects: effects,
               erWeights: Array.isArray(settings?.timber_weights) ? settings.timber_weights : [],
               language: String(language || '')
             });
@@ -1159,11 +1171,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           },
 
           submitDirectLongText: async function(expectedText, expectedSignature, expectedVoiceId, requestedTimeout) {
-            var webpackRequire = null;
-            window.webpackChunk_N_E = window.webpackChunk_N_E || [];
-            window.webpackChunk_N_E.push([['minimax-direct-long-' + Date.now()], {}, function(require) {
-              webpackRequire = require;
-            }]);
+            var webpackRequire = window.__mmWebpackRequire;
+            if (!webpackRequire) {
+              window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+              window.webpackChunk_N_E.push([['minimax-direct-long'], {}, function(require) {
+                webpackRequire = require;
+              }]);
+              window.__mmWebpackRequire = webpackRequire || null;
+            }
             if (!webpackRequire?.m) return { ok: false, disposition: 'not_sent', reason: 'minimax_api_runtime_missing' };
             var managerModuleId = webpackRequire.m['78544'] ? '78544' : Object.keys(webpackRequire.m).find(function(id) {
               return String(webpackRequire.m[id]).indexOf('/v1/api/audio/ws') >= 0;
@@ -1315,11 +1330,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           },
 
           generateDirectAudio: async function(expectedText, expectedSignature, expectedVoiceId, requestedTimeout) {
-            var webpackRequire = null;
-            window.webpackChunk_N_E = window.webpackChunk_N_E || [];
-            window.webpackChunk_N_E.push([['minimax-direct-regular-' + Date.now()], {}, function(require) {
-              webpackRequire = require;
-            }]);
+            var webpackRequire = window.__mmWebpackRequire;
+            if (!webpackRequire) {
+              window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+              window.webpackChunk_N_E.push([['minimax-direct-regular'], {}, function(require) {
+                webpackRequire = require;
+              }]);
+              window.__mmWebpackRequire = webpackRequire || null;
+            }
             if (!webpackRequire?.m) return { ok: false, disposition: 'not_sent', reason: 'minimax_api_runtime_missing' };
             var managerModuleId = webpackRequire.m['78544'] ? '78544' : Object.keys(webpackRequire.m).find(function(id) {
               return String(webpackRequire.m[id]).indexOf('/v1/api/audio/ws') >= 0;
@@ -1402,7 +1420,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             return await new Promise(function(resolve) {
               var settled = false;
               var opened = false;
-              var audioHex = '';
+              var audioHexChunks = [];
               var finish = function(result) {
                 if (settled) return;
                 settled = true;
@@ -1451,17 +1469,32 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     }
                     var status = Number(message?.data?.status);
                     if (!message?.data || (status !== 1 && status !== 2)) return;
-                    if (typeof message.data.audio === 'string') {
-                      audioHex += message.data.audio;
+                    if (typeof message.data.audio === 'string' && message.data.audio) {
+                      audioHexChunks.push(message.data.audio);
                     }
                     if (status !== 2) return;
-                    if (!audioHex || audioHex.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(audioHex)) {
+                    var audioHex = audioHexChunks.join('');
+                    if (!audioHex || audioHex.length % 2 !== 0) {
                       finish({ ok: false, disposition: 'accepted_unknown', reason: 'minimax_direct_audio_invalid', msgId: msgId, responseMeta: responseMeta });
                       return;
                     }
-                    var bytes = new Uint8Array(audioHex.length / 2);
-                    for (var index = 0; index < bytes.length; index += 1) {
-                      bytes[index] = parseInt(audioHex.slice(index * 2, index * 2 + 2), 16);
+                    var hexTable = new Uint8Array(128);
+                    for (var t = 0; t < 128; t += 1) hexTable[t] = 255;
+                    '0123456789abcdefABCDEF'.split('').forEach(function(ch, idx) {
+                      hexTable[ch.charCodeAt(0)] = idx < 16 ? idx : idx - 6;
+                    });
+                    var byteLen = audioHex.length / 2;
+                    var bytes = new Uint8Array(byteLen);
+                    var hexValid = true;
+                    for (var index = 0; index < byteLen; index += 1) {
+                      var hi = hexTable[audioHex.charCodeAt(index * 2)];
+                      var lo = hexTable[audioHex.charCodeAt(index * 2 + 1)];
+                      if (hi > 15 || lo > 15) { hexValid = false; break; }
+                      bytes[index] = (hi << 4) | lo;
+                    }
+                    if (!hexValid) {
+                      finish({ ok: false, disposition: 'accepted_unknown', reason: 'minimax_direct_audio_invalid', msgId: msgId, responseMeta: responseMeta });
+                      return;
                     }
                     var audioOffset = 0;
                     if (bytes.length >= 10 && bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) {

@@ -2098,21 +2098,26 @@ document.addEventListener('DOMContentLoaded', async () => {
           });
           if (queue.length === 0) continue;
           
-          const missingMap = new Map();
-          queue.forEach((entry) => {
-               if (entry.voiceId || entry.voiceName) return;
-              const key = getVoiceMappingKey(entry.speaker, entry.languageCode || '');
-              if (!missingMap.has(key)) {
-                  const label = entry.languageCode ? `[${entry.languageCode}] ${entry.speaker}` : entry.speaker;
-                  missingMap.set(key, label);
-              }
-          });
-          const missing = [...missingMap.values()];
-          if (missing.length) {
-              return showStatus(`Запуск заблокирован. Нет голоса для: ${missing.join(', ')}`, 'error');
+          // Пропускаем реплики без голоса вместо блокировки всего запуска.
+          // Это позволяет генерировать только те реплики, у которых голос назначен.
+          const mappedQueue = queue.filter((entry) => entry.voiceId || entry.voiceName);
+          const skippedCount = queue.length - mappedQueue.length;
+          if (skippedCount > 0) {
+              const missingMap = new Map();
+              queue.forEach((entry) => {
+                  if (entry.voiceId || entry.voiceName) return;
+                  const key = getVoiceMappingKey(entry.speaker, entry.languageCode || '');
+                  if (!missingMap.has(key)) {
+                      const label = entry.languageCode ? `[${entry.languageCode}] ${entry.speaker}` : entry.speaker;
+                      missingMap.set(key, label);
+                  }
+              });
+              const missing = [...missingMap.values()];
+              showStatus(`Пропущено ${skippedCount} реплик без голоса: ${missing.join(', ')}`, 'warning');
           }
+          if (mappedQueue.length === 0) continue;
 
-          batchJobs.push({ queue, mode: 'multi', scriptName });
+          batchJobs.push({ queue: mappedQueue, mode: 'multi', scriptName });
       }
 
       if (batchJobs.length === 0) return showStatus('Очередь пуста', 'error');
@@ -2121,7 +2126,8 @@ document.addEventListener('DOMContentLoaded', async () => {
       try {
           const mappingInspection = await inspectVoiceMappingPlan();
           if (!mappingInspection.valid) {
-              return showStatus('Запуск заблокирован: исправьте voice mapping', 'error');
+              const t = mappingInspection.totals || {};
+              showStatus(`Внимание: voice mapping неполный (missing ${t.missing || 0}, stale ${t.stale || 0}). Генерируются только реплики с голосом.`, 'warning');
           }
           await preflightQueueVoices(batchJobs, activeTabId);
           await preflightGenerationCredit(batchJobs, activeTabId);

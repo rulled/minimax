@@ -544,7 +544,7 @@ class VoiceoverAutomation {
         return this.callBridge('getDirectTtsCapability');
     }
 
-    async waitForDirectTtsReady(expectedText, expectedVoiceId = '', expectedLanguage = '', timeout = 5000) {
+    async waitForDirectTtsReady(expectedText, expectedVoiceId = '', expectedLanguage = '', timeout = 10000) {
         const startedAt = Date.now();
         let stableLanguage = '';
         let stableCount = 0;
@@ -562,7 +562,9 @@ class VoiceoverAutomation {
                 stableLanguage = state?.ok ? state.language : '';
                 stableCount = state?.ok ? 1 : 0;
             }
-            await this.sleep(300);
+            // 150ms достаточно для поимки транзиентного "готового" состояния
+            // (сокращение с 300ms ускоряет стабилизацию на ~150ms/итер).
+            await this.sleep(150);
         }
         throw new Error('Direct TTS state did not stabilize');
     }

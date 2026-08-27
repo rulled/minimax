@@ -108,6 +108,7 @@ async function main() {
     '--start-direct-file-canary',
     '--start-direct-long-canary',
     '--start-direct-sequential-canary',
+    '--trigger-blocked-capture',
     '--start-bg-multivoice-direct',
     '--refresh-and-start-multi'
   ];
@@ -436,23 +437,156 @@ async function main() {
     return;
   }
 
-  if (process.argv.includes('--probe-direct-blocked')) {
-    if (!popup) throw new Error('MiniMax popup not found');
-    const result = await evaluate(popup, `(async () => {
-      const [tab] = await chrome.tabs.query({ url: 'https://www.minimax.io/audio/text-to-speech*' });
-      if (!tab?.id) return { success: false, reason: 'minimax_tab_not_found' };
-      return chrome.tabs.sendMessage(tab.id, { action: 'probeDirectRegularBlocked' });
-    })()`);
-    console.log(JSON.stringify(result, null, 2));
-    return;
-  }
+  if (process.argv.includes('--probe-direct-contract')) {
+    if (!minimaxPage) throw new Error('MiniMax page not found');
+    const result = await evaluate(minimaxPage, `(() => {
+      let webpackRequire = null;
+      window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+      window.webpackChunk_N_E.push([['minimax-contract-probe-' + Date.now()], {}, (require) => {
+        webpackRequire = require;
+      }]);
+      if (!webpackRequire?.m) return { ok: false, reason: 'webpack_runtime_missing' };
 
-  if (process.argv.includes('--probe-direct-long-blocked')) {
-    if (!popup) throw new Error('MiniMax popup not found');
-    const result = await evaluate(popup, `(async () => {
-      const [tab] = await chrome.tabs.query({ url: 'https://www.minimax.io/audio/text-to-speech*' });
-      if (!tab?.id) return { success: false, reason: 'minimax_tab_not_found' };
-      return chrome.tabs.sendMessage(tab.id, { action: 'probeDirectLongBlocked' });
+      const managerModuleId = webpackRequire.m['78544'] ? '78544' : Object.keys(webpackRequire.m).find((id) => (
+        String(webpackRequire.m[id]).includes('/v1/api/audio/ws')
+      ));
+      const managerModule = managerModuleId ? webpackRequire(managerModuleId) : null;
+      const manager = managerModule && Object.values(managerModule).find((value) => (
+        value && typeof value.initWebSocket === 'function' && typeof value.close === 'function'
+      ));
+      const storeModule = webpackRequire.m['66021'] ? webpackRequire('66021') : null;
+      const state = storeModule?.store?.getState?.();
+      const settings = state?.tts?.settings;
+      const effects = state?.voice?.effects;
+      if (!manager || !settings || !effects || !state) {
+        return { ok: false, reason: 'minimax_tts_runtime_incomplete' };
+      }
+
+      const model = String(state.global?.constantsMap?.selectedModel || '');
+      const voiceId = String(settings.voice_id || '');
+      const language = state.detect?.isDetecting ? state.detect?.detectedLanguage : settings.language_boost;
+      if (!model || !voiceId) return { ok: false, reason: 'minimax_direct_settings_incomplete' };
+
+      const makeFrame = (longText) => ({
+        method: longText ? 'T2aAsync' : undefined,
+        payload: {
+          model,
+          text: 'Dry-run transport contract probe.',
+          voice_setting: {
+            speed: Number(settings.speed),
+            vol: Number(settings.vol),
+            pitch: Number(settings.pitch),
+            voice_id: voiceId
+          },
+          audio_setting: {
+            sample_rate: settings.sample_rate,
+            bitrate: settings.bitrate,
+            format: settings.format,
+            channel: settings.channel
+          },
+          effects: {
+            deepen_lighten: Number(effects.deepen_lighten || 0),
+            stronger_softer: Number(effects.stronger_softer || 0),
+            nasal_crisp: Number(effects.nasal_crisp || 0),
+            spacious_echo: Boolean(effects.spacious_echo),
+            lofi_telephone: Boolean(effects.lofi_telephone),
+            robotic: Boolean(effects.robotic),
+            auditorium_echo: Boolean(effects.auditorium_echo)
+          },
+          er_weights: Array.isArray(settings.timber_weights) ? settings.timber_weights : [],
+          language_boost: language,
+          stream: true
+        },
+        msg_id: crypto.randomUUID()
+      });
+      const summarizeFrame = (frame) => ({
+        keys: Object.keys(frame).filter((key) => frame[key] !== undefined).sort(),
+        method: frame.method || '',
+        payloadKeys: Object.keys(frame.payload || {}).filter((key) => frame.payload[key] !== undefined).sort(),
+        voiceSettingKeys: Object.keys(frame.payload?.voice_setting || {}).filter((key) => frame.payload.voice_setting[key] !== undefined).sort(),
+        audioSettingKeys: Object.keys(frame.payload?.audio_setting || {}).filter((key) => frame.payload.audio_setting[key] !== undefined).sort(),
+        effectKeys: Object.keys(frame.payload?.effects || {}).filter((key) => frame.payload.effects[key] !== undefined).sort(),
+        valueTypes: Object.fromEntries(Object.entries(frame.payload || {})
+          .filter(([key]) => key !== 'text' && key !== 'voice_setting' && key !== 'audio_setting' && key !== 'effects')
+          .map(([key, value]) => [key, Array.isArray(value) ? 'array' : typeof value])),
+        msgIdType: typeof frame.msg_id,
+        msgIdLength: String(frame.msg_id || '').length,
+        msgIdUuidLike: /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(String(frame.msg_id || '')),
+        textLength: String(frame.payload?.text || '').length
+      });
+
+      const expectedQueryKeys = [
+        'app_id', 'biz_id', 'device_platform', 'lang', 'op_ticket', 'token',
+        'unix', 'uuid', 'version_code', 'yy'
+      ];
+      const NativeWebSocket = window.WebSocket;
+      const sockets = [];
+      class ProbeWebSocket {
+        constructor(url) {
+          this.url = String(url || '');
+          this.readyState = ProbeWebSocket.CONNECTING;
+          sockets.push(this);
+        }
+        send() { throw new Error('probe_socket_send_blocked'); }
+        close() { this.readyState = ProbeWebSocket.CLOSED; }
+      }
+      ProbeWebSocket.CONNECTING = 0;
+      ProbeWebSocket.OPEN = 1;
+      ProbeWebSocket.CLOSING = 2;
+      ProbeWebSocket.CLOSED = 3;
+
+      const frames = [makeFrame(false), makeFrame(true)];
+      const probeKeys = frames.map((_, index) => 'contract-probe-' + index + '-' + Date.now());
+      try {
+        window.WebSocket = ProbeWebSocket;
+        frames.forEach((frame, index) => {
+          manager.initWebSocket({
+            url: '/v1/api/audio/ws',
+            body: frame,
+            wsKey: probeKeys[index],
+            onOpen() {},
+            onMessage() {},
+            onError() {},
+            onClose() {}
+          });
+        });
+      } catch (error) {
+        return { ok: false, reason: 'contract_probe_failed', errorName: String(error?.name || 'Error') };
+      } finally {
+        probeKeys.forEach((key) => {
+          try { manager.close(key); } catch (_) {}
+        });
+        window.WebSocket = NativeWebSocket;
+      }
+
+      const socketMetadata = sockets.map((socket) => {
+        try {
+          const url = new URL(socket.url);
+          const queryKeys = [...url.searchParams.keys()].sort();
+          return {
+            origin: url.origin,
+            pathname: url.pathname,
+            queryKeys,
+            hasRequiredAuthShape: expectedQueryKeys.every((key) => queryKeys.includes(key))
+          };
+        } catch (_) {
+          return { origin: '', pathname: '', queryKeys: [], hasRequiredAuthShape: false };
+        }
+      });
+      return {
+        ok: sockets.length === frames.length
+          && socketMetadata.every((socket) => socket.origin === 'wss://www.minimax.io'
+            && socket.pathname === '/v1/api/audio/ws'
+            && socket.hasRequiredAuthShape),
+        networkBlocked: true,
+        managerModuleId: String(managerModuleId || ''),
+        helperModules: {
+          query: webpackRequire.m['1140'] ? '1140' : '',
+          signature: webpackRequire.m['51063'] ? '51063' : ''
+        },
+        sockets: socketMetadata,
+        frames: frames.map(summarizeFrame)
+      };
     })()`);
     console.log(JSON.stringify(result, null, 2));
     return;
