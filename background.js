@@ -1368,6 +1368,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               return { ok: false, disposition: 'not_sent', reason: 'minimax_direct_format_unsupported' };
             }
             var language = state.detect?.isDetecting ? state.detect?.detectedLanguage : settings.language_boost;
+            // SYNC:signature — mirrors computeStateSignature in direct_transport.js.
+            // This block is duplicated in getDirectTtsReadyState, submitDirectLongText,
+            // and generateDirectAudio. All three MUST stay byte-identical or the
+            // transport functions return minimax_direct_settings_changed. Keep
+            // effects bare (no `|| null`) — see computeStateSignature tests.
             var currentSignature = JSON.stringify({
               model: model,
               voiceSetting: { speed: settings.speed, vol: settings.vol, pitch: settings.pitch, voiceId: voiceId },
@@ -1386,6 +1391,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             }
             var msgId = crypto.randomUUID();
             var wsKey = 'tts';
+            // SYNC:buildFrame — mirrors buildT2aAsyncFrame in direct_transport.js.
             var frame = {
               payload: {
                 model: model,
@@ -1474,6 +1480,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     }
                     if (status !== 2) return;
                     var audioHex = audioHexChunks.join('');
+                    // SYNC:hexDecode — mirrors decodeHexAudio in direct_transport.js.
+                    // Update both and re-run tests/direct_transport.test.js if this changes.
                     if (!audioHex || audioHex.length % 2 !== 0) {
                       finish({ ok: false, disposition: 'accepted_unknown', reason: 'minimax_direct_audio_invalid', msgId: msgId, responseMeta: responseMeta });
                       return;
