@@ -1348,14 +1348,16 @@ class VoiceoverAutomation {
                 await this.rollbackUndispatchedSubmission(entry, submissionId);
                 throw error;
             }
-            // Floor at 60s: a 25MB audio stream on a loaded server can take
-            // 30-90s even for short text after a heavy entry. Cap at 150s to
-            // stay under the background's 180s server-side watchdog ceiling.
+            // Floor at 60s: a loaded server can take 30-90s even for short text
+            // after a heavy entry. Slope ~25 chars/s with a 300s cap — the server
+            // only sends the final frame after the full MP3 stream is in, and a
+            // bridge timeout discards a paid take. The MAIN world honours the
+            // requested timeout (its 180s default only applies when none passed).
             // The trailing number is the bridge timeout in ms; callDirectBridge
             // strips it before forwarding args to the MAIN world function,
             // which receives (text, signature, voiceId, requestedTimeout).
             const textLen = String(entry.text || '').length;
-            const generationTimeout = Math.max(60000, Math.min(150000, Math.ceil(textLen / 50) * 1000));
+            const generationTimeout = Math.max(60000, Math.min(300000, Math.ceil(textLen / 25) * 1000));
             directResult = await this.callDirectBridge(
                 'generateDirectAudio',
                 entry.text,
