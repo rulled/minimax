@@ -13,6 +13,7 @@ const {
   getDefaultParallelBatchState,
   buildParallelPlan,
   getParallelQueueSnapshot,
+  getParallelWorkerSummary,
   isEntryProtected,
   buildRemainingFromWorkers
 } = require('../parallel_batch.js');
@@ -214,6 +215,9 @@ test('getParallelQueueSnapshot: projects redacted fields only (no text)', () => 
   assert.deepEqual(snap[0], {
     _parallelKey: 'k1',
     id: 'i1',
+    speaker: '',
+    voiceName: 'voice-a',
+    preview: '',
     status: 'completed',
     downloadConfirmed: true,
     paidSubmissionStarted: true,
@@ -231,6 +235,44 @@ test('getParallelQueueSnapshot: defaults — pending status, false flags, submit
   assert.equal(snap[0].paidSubmissionStarted, false);
   assert.equal(snap[0].submissionRejected, false);
   assert.equal(snap[0].submittedAt, 0);
+});
+
+test('getParallelQueueSnapshot: keeps display data but never full text', () => {
+  const snap = getParallelQueueSnapshot([entry({
+    speaker: 'ДИКТОР',
+    voiceName: 'о1',
+    preview: 'p'.repeat(200),
+    text: 'FULL_SCRIPT_MUST_NOT_BE_PERSISTED'
+  })]);
+  assert.equal(snap[0].speaker, 'ДИКТОР');
+  assert.equal(snap[0].voiceName, 'о1');
+  assert.equal(snap[0].preview.length, 160);
+  assert.equal(Object.prototype.hasOwnProperty.call(snap[0], 'text'), false);
+});
+
+test('getParallelWorkerSummary: derives current entry and aggregate worker counts', () => {
+  const worker = {
+    workerId: 'worker-1',
+    status: 'running',
+    currentIndex: 1,
+    total: 3,
+    queue: getParallelQueueSnapshot([
+      entry({ id: 'done', speaker: 'A', voiceName: 'voice A', preview: 'first', status: 'completed' }),
+      entry({ id: 'now', speaker: 'B', voiceName: 'voice B', preview: 'second', status: 'processing' }),
+      entry({ id: 'bad', speaker: 'C', voiceName: 'voice C', preview: 'third', status: 'error', error: 'failed' })
+    ])
+  };
+  assert.deepEqual(getParallelWorkerSummary(worker), {
+    workerId: 'worker-1',
+    status: 'running',
+    currentIndex: 1,
+    total: 3,
+    completed: 1,
+    errors: 1,
+    currentEntry: {
+      id: 'now', speaker: 'B', voiceName: 'voice B', preview: 'second', status: 'processing', error: null
+    }
+  });
 });
 
 test('getParallelQueueSnapshot: non-array input returns empty array', () => {

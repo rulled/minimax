@@ -170,7 +170,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({ success: false, reason: 'disabled' });
         return;
       }
-      if (automation?.isRunning) {
+      if (automation && (automation.isRunning || automation.longTextInFlight)) {
         sendResponse({ success: false, reason: 'automation_already_running' });
         return;
       }
@@ -244,6 +244,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           runId: automation?.runId || null,
           workerId: automation?.workerId || null,
           legacyJobId: automation?.legacyJobId || null,
+          longTextInFlight: automation?.longTextInFlight === true,
+          longTextCancellationRequested: automation?.longTextCancellationRequested === true,
         queue: automation?.queue?.map((entry) => ({
           id: entry.id,
           status: entry.status,
@@ -408,6 +410,7 @@ class VoiceoverAutomation {
         this.skippedEntries = []; 
         this.heartbeatTimer = null;
         this.longTextCancellationRequested = false;
+        this.longTextInFlight = false;
         
         this.selectors = {
             textarea: '[data-slate-editor="true"]',
@@ -548,13 +551,22 @@ class VoiceoverAutomation {
         const startedAt = Date.now();
         let stableLanguage = '';
         let stableCount = 0;
+        let lastState = null;
+        let pollCount = 0;
+        let okSeenCount = 0;
         while (Date.now() - startedAt < timeout) {
+            if (this.longTextCancellationRequested) {
+                throw new Error('Long text submission cancelled during ready-wait');
+            }
             const state = await this.callBridge(
                 'getDirectTtsReadyState',
                 expectedText,
                 expectedVoiceId,
                 expectedLanguage
             );
+            lastState = state;
+            pollCount += 1;
+            if (state?.ok) okSeenCount += 1;
             if (state?.ok && state.language === stableLanguage) {
                 stableCount += 1;
                 if (stableCount >= 2) return state;
@@ -566,6 +578,19 @@ class VoiceoverAutomation {
             // (сокращение с 300ms ускоряет стабилизацию на ~150ms/итер).
             await this.sleep(150);
         }
+        DiagLog.warn('longText', 'Direct TTS state did not stabilize', {
+            expectedLen: String(expectedText || '').length,
+            textMatches: lastState?.textMatches ?? null,
+            ok: lastState?.ok ?? null,
+            okSeenCount,
+            language: lastState?.language ?? null,
+            languageMatches: lastState?.languageMatches ?? null,
+            isDetecting: lastState?.isDetecting ?? null,
+            voiceId: lastState?.voiceId ?? null,
+            model: lastState?.model ?? null,
+            pollCount,
+            timeoutMs: timeout
+        });
         throw new Error('Direct TTS state did not stabilize');
     }
 
@@ -575,59 +600,67 @@ class VoiceoverAutomation {
             throw new Error('Long Text length is outside 5001-200000');
         }
 
-        await this.openPageTab('Settings');
-        const voiceLabel = task.voiceName || task.voiceId;
-        if (voiceLabel) await this.switchVoice(voiceLabel, task.voiceId || '');
-        if (task.language) await this.ensureLanguage(task.language);
-        await this.setLongTextMode(true);
+        this.longTextInFlight = true;
+        try {
+            await this.openPageTab('Settings');
+            const voiceLabel = task.voiceName || task.voiceId;
+            if (voiceLabel) await this.switchVoice(voiceLabel, task.voiceId || '');
+            if (task.language) await this.ensureLanguage(task.language);
+            await this.setLongTextMode(true);
 
-        const editor = await this.waitForElement('[data-slate-editor="true"]', 5000);
-        if (!editor) throw new Error('Textarea (Slate editor) not found');
-        await this.insertText(editor, task.text);
+            const editor = await this.waitForElement('[data-slate-editor="true"]', 5000);
+            if (!editor) throw new Error('Textarea (Slate editor) not found');
+            await this.clearText();
+            await this.insertText(editor, task.text);
 
-        const generateButton = await this.waitForGenerateButtonReady(30000);
-        if (!generateButton) throw new Error('Generate button not active for Long Text');
-        this.throwIfLongTextCancelled();
-        const readyState = await this.waitForDirectTtsReady(
-            task.text,
-            task.voiceId || '',
-            task.language || ''
-        );
-        this.throwIfLongTextCancelled();
-        const submittedAt = Date.now();
-        const reservation = await chrome.runtime.sendMessage({
+            const generateButton = await this.waitForGenerateButtonReady(30000);
+            if (!generateButton) throw new Error('Generate button not active for Long Text');
+            this.throwIfLongTextCancelled();
+            const readyTimeout = Math.max(10000, Math.ceil(String(task.text).length / 1000) * 1500);
+            const readyState = await this.waitForDirectTtsReady(
+                task.text,
+                task.voiceId || '',
+                task.language || '',
+                readyTimeout
+            );
+            this.throwIfLongTextCancelled();
+            const submittedAt = Date.now();
+            const reservation = await chrome.runtime.sendMessage({
                 action: 'reserveLongTextSubmission',
                 localId: task.localId,
                 reservedAt: submittedAt,
                 transport: 'direct'
             });
-        if (!reservation?.success) {
+            if (!reservation?.success) {
                 throw new Error(`Long Text reservation failed: ${reservation?.reason || 'unknown error'}`);
-        }
-        if (this.longTextCancellationRequested) {
+            }
+            if (this.longTextCancellationRequested) {
                 await this.releaseLongTextReservation(task.localId);
                 this.throwIfLongTextCancelled();
-        }
-        const dispatchMarker = await chrome.runtime.sendMessage({
+            }
+            const dispatchMarker = await chrome.runtime.sendMessage({
                 action: 'markLongTextDispatched',
                 localId: task.localId,
                 dispatchedAt: submittedAt
-        });
-        if (!dispatchMarker?.success) {
+            });
+            if (!dispatchMarker?.success) {
                 await this.releaseLongTextReservation(task.localId);
                 throw new Error(`Long Text dispatch marker failed: ${dispatchMarker?.reason || 'unknown error'}`);
-        }
-        if (this.longTextCancellationRequested) {
+            }
+            if (this.longTextCancellationRequested) {
                 await this.releaseLongTextReservation(task.localId);
                 this.throwIfLongTextCancelled();
-        }
-        const directResult = await this.callDirectBridge(
+            }
+            if (this.longTextCancellationRequested || this.isStopped) {
+                return { success: false, reason: 'cancelled_before_dispatch' };
+            }
+            const directResult = await this.callDirectBridge(
                 'submitDirectLongText',
                 task.text,
                 readyState.signature,
                 task.voiceId || ''
             );
-        await chrome.storage.local.set({
+            await chrome.storage.local.set({
                 directTtsLastResult: {
                     mode: 'long',
                     recordedAt: Date.now(),
@@ -637,34 +670,40 @@ class VoiceoverAutomation {
                     code: directResult?.code ?? null,
                     responseMeta: directResult?.responseMeta || null
                 }
-        });
-        if (directResult?.ok) {
+            });
+            if (this.longTextCancellationRequested) {
+                return { success: false, reason: 'cancelled_after_dispatch', submittedAt: Date.now() };
+            }
+            if (directResult?.ok) {
                 return {
                     submittedAt,
                     transport: 'direct',
                     disposition: directResult.disposition,
                     msgId: directResult.msgId || ''
                 };
-        }
-        if (directResult?.disposition === 'rejected') {
+            }
+            if (directResult?.disposition === 'rejected') {
                 await chrome.runtime.sendMessage({
                     action: 'markLongTextRejected',
                     localId: task.localId,
                     reason: directResult?.reason || directResult?.disposition || 'unknown'
                 });
                 throw new Error(`Direct Long Text rejected: ${directResult?.reason || directResult?.disposition || 'unknown'}`);
-        }
-        if (!['not_sent', 'not_invoked'].includes(directResult?.disposition)) {
+            }
+            if (!['not_sent', 'not_invoked'].includes(directResult?.disposition)) {
                 throw new Error(`Direct Long Text may have been accepted: ${directResult?.reason || directResult?.disposition || 'unknown'}`);
-        }
-        const release = await chrome.runtime.sendMessage({
+            }
+            const release = await chrome.runtime.sendMessage({
                 action: 'releaseLongTextReservation',
                 localId: task.localId
             });
-        if (!release?.success) {
+            if (!release?.success) {
                 throw new Error(`Long Text reservation release failed: ${release?.reason || 'unknown error'}`);
+            }
+            throw new Error(`Direct Long Text was not sent: ${directResult?.reason || directResult?.disposition || 'unknown'}`);
+        } finally {
+            this.longTextInFlight = false;
         }
-        throw new Error(`Direct Long Text was not sent: ${directResult?.reason || directResult?.disposition || 'unknown'}`);
     }
 
     throwIfLongTextCancelled() {
@@ -1236,12 +1275,6 @@ class VoiceoverAutomation {
             throw new Error('Generate button not active');
         }
 
-        const directReadyState = await this.waitForDirectTtsReady(
-            entry.text,
-            entry.voiceId || '',
-            entry.language || ''
-        );
-
         const historyInstallResult = await this.callBridge('ensureLongTextHistoryCapture');
         if (!historyInstallResult?.ok) {
             throw new Error(`History capture install failed: ${historyInstallResult?.reason || 'unknown reason'}`);
@@ -1325,7 +1358,7 @@ class VoiceoverAutomation {
             directResult = await this.callDirectBridge(
                 'generateDirectAudio',
                 entry.text,
-                directReadyState.signature,
+                '',
                 entry.voiceId || ''
             );
             await chrome.storage.local.set({
@@ -1471,11 +1504,14 @@ class VoiceoverAutomation {
     async callBridge(action, ...args) {
         // Шлём только имя метода (строку) и аргументы.
         // Сами функции определены в background.js — Chrome не сериализует функции через sendMessage.
-        const response = await chrome.runtime.sendMessage({
-            action: 'executeInMainWorld',
-            method: action,
-            args
-        });
+        const response = await Promise.race([
+            chrome.runtime.sendMessage({
+                action: 'executeInMainWorld',
+                method: action,
+                args
+            }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('bridge_timeout')), 15000))
+        ]);
 
         if (!response || !response.success) {
             this.error('Bridge call failed: ' + (response && response.reason || 'unknown'));
@@ -1486,16 +1522,22 @@ class VoiceoverAutomation {
 
     async callDirectBridge(action, ...args) {
         try {
-            const response = await chrome.runtime.sendMessage({
-                action: 'executeInMainWorld',
-                method: action,
-                args
-            });
+            const response = await Promise.race([
+                chrome.runtime.sendMessage({
+                    action: 'executeInMainWorld',
+                    method: action,
+                    args
+                }),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('bridge_timeout')), 15000))
+            ]);
             if (!response?.success) {
                 return { ok: false, disposition: 'accepted_unknown', reason: response?.reason || 'direct_bridge_response_failed' };
             }
             return response.result || { ok: false, disposition: 'accepted_unknown', reason: 'direct_bridge_empty_result' };
         } catch (error) {
+            if (error?.message === 'bridge_timeout') {
+                return { ok: false, disposition: 'bridge_timeout', reason: 'bridge_timeout' };
+            }
             return { ok: false, disposition: 'accepted_unknown', reason: error?.message || 'direct_bridge_response_failed' };
         }
     }
@@ -1528,13 +1570,19 @@ class VoiceoverAutomation {
         this.log('✅ beforeinput dispatched via main world bridge');
 
         // Ожидание обновления state
-        const waitTime = text.length > 500 ? 1500 : 800;
+        const waitTime = Math.max(1500, Math.ceil(text.length / 1000) * 200);
         this.log(`   ⏳ Waiting ${waitTime}ms for Slate...`);
         await this.sleep(waitTime);
 
         // Проверяем state
-        let slateText = await this.callBridge('getText');
-        if (normalizeText(slateText) === normalizeText(text)) {
+        let slateText = null;
+        let confirmed = false;
+        for (let attempt = 0; attempt < 5 && !confirmed; attempt++) {
+            if (attempt > 0) await this.sleep(500);
+            slateText = await this.callBridge('getText');
+            confirmed = normalizeText(slateText) === normalizeText(text);
+        }
+        if (confirmed) {
             this.log(`✅ Slate state confirmed: "${slateText.slice(0, 50)}${slateText.length > 50 ? '...' : ''}"`);
         } else {
             this.log('⚠️ Slate state mismatch, пробуем paste fallback...');

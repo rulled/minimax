@@ -1156,14 +1156,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               erWeights: Array.isArray(settings?.timber_weights) ? settings.timber_weights : [],
               language: String(language || '')
             });
+            var normText = function(s){ return String(s || '').replace(/\s+/g, ' ').trim(); };
+            var textMatchesNorm = normText(text) === normText(expectedText);
             return {
-              ok: Boolean(state && settings && text && text === String(expectedText || '')
+              ok: Boolean(state && settings && text && textMatchesNorm
                 && String(state.global?.constantsMap?.selectedModel || '')
                 && String(settings.voice_id || '')
                 && (!expectedVoiceId || String(settings.voice_id || '') === String(expectedVoiceId))
                 && languageReady
                 && languageMatches),
-              textMatches: text === String(expectedText || ''),
+              textMatches: textMatchesNorm,
               model: String(state?.global?.constantsMap?.selectedModel || ''),
               voiceId: String(settings?.voice_id || ''),
               language: String(language || ''),
@@ -1196,7 +1198,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             var settings = state?.tts?.settings;
             var effects = state?.voice?.effects;
             var text = String(state?.tts?.currentText || '');
-            if (!manager || !settings || !effects || !text || text !== String(expectedText || '')) {
+            var normTextLT = function(s){ return String(s || '').replace(/\s+/g, ' ').trim(); };
+            if (!manager || !settings || !effects || !text || normTextLT(text) !== normTextLT(expectedText)) {
               return { ok: false, disposition: 'not_sent', reason: 'minimax_direct_state_mismatch' };
             }
             var model = String(state.global?.constantsMap?.selectedModel || '');
@@ -1355,7 +1358,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             var settings = state?.tts?.settings;
             var effects = state?.voice?.effects;
             var text = String(state?.tts?.currentText || '');
-            if (!manager || !settings || !effects || !text || text !== String(expectedText || '')) {
+            var normTextLT = function(s){ return String(s || '').replace(/\s+/g, ' ').trim(); };
+            if (!manager || !settings || !effects || !text || normTextLT(text) !== normTextLT(expectedText)) {
               return { ok: false, disposition: 'not_sent', reason: 'minimax_direct_state_mismatch' };
             }
             var model = String(state.global?.constantsMap?.selectedModel || '');
@@ -1389,7 +1393,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               erWeights: Array.isArray(settings.timber_weights) ? settings.timber_weights : [],
               language: String(language || '')
             });
-            if (!expectedSignature || currentSignature !== expectedSignature) {
+            if (expectedSignature && currentSignature !== expectedSignature) {
               return { ok: false, disposition: 'not_sent', reason: 'minimax_direct_settings_changed' };
             }
             var msgId = crypto.randomUUID();
@@ -1845,6 +1849,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               var submittedAt = Number(task.submittedAt);
               return !earliest || submittedAt < earliest ? submittedAt : earliest;
             }, 0);
+            var normUpdateTime = function(raw) {
+              var n = Number(raw || 0);
+              if (n && n < 1e12) n *= 1000;
+              return n;
+            };
 
             try {
               while (hasMore && page <= maxPages) {
@@ -1868,7 +1877,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                   targetAudioIds.delete(String(item.audio_id || ''));
                 });
                 var oldestUpdateTime = pageItems.reduce(function(oldest, item) {
-                  var updateTime = Number(item.update_time || 0);
+                  var updateTime = normUpdateTime(item.update_time);
                   return !oldest || updateTime < oldest ? updateTime : oldest;
                 }, 0);
                 var reachedSubmissionWindow = earliestSubmission
@@ -1878,7 +1887,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
                 hasMore = Boolean(payload?.has_more);
                 if (pageItems.length === 0) break;
-                if (knownIdsFound
+                if (requestedTasks.length > 0 && knownIdsFound
                   && (!hasTextTargets || reachedSubmissionWindow)) {
                   stoppedAfterMatch = true;
                   break;
@@ -1921,21 +1930,25 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 });
               }
               candidates.sort(function(a, b) {
-                if (!task.submittedAt) return Number(b.update_time || 0) - Number(a.update_time || 0);
-                return Math.abs(Number(a.update_time || 0) - Number(task.submittedAt))
-                  - Math.abs(Number(b.update_time || 0) - Number(task.submittedAt));
+                if (!task.submittedAt) return normUpdateTime(b.update_time) - normUpdateTime(a.update_time);
+                return Math.abs(normUpdateTime(a.update_time) - Number(task.submittedAt))
+                  - Math.abs(normUpdateTime(b.update_time) - Number(task.submittedAt));
               });
               candidates = candidates.filter(function(item) {
                 if (task.audioId || !task.submittedAt) return true;
-                return Number(item.update_time || 0) >= Number(task.submittedAt);
+                return normUpdateTime(item.update_time) >= Number(task.submittedAt);
               });
               if (!task.audioId && candidates.length > 1) {
-                return {
-                  localId: task.localId,
-                  record: null,
-                  ambiguous: true,
-                  candidateAudioIds: candidates.map(function(item) { return String(item.audio_id || ''); })
-                };
+                var topDelta = Math.abs(normUpdateTime(candidates[0].update_time) - Number(task.submittedAt || 0));
+                var secondDelta = Math.abs(normUpdateTime(candidates[1].update_time) - Number(task.submittedAt || 0));
+                if (Math.abs(topDelta - secondDelta) < 5000) {
+                  return {
+                    localId: task.localId,
+                    record: null,
+                    ambiguous: true,
+                    candidateAudioIds: candidates.map(function(item) { return String(item.audio_id || ''); })
+                  };
+                }
               }
               var record = candidates[0] || null;
               if (!record) return { localId: task.localId, record: null };
@@ -1947,7 +1960,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                   status: Number(record.status),
                   async: Number(record.async),
                   audioUrl: String(record.audio_url || ''),
-                  updateTime: Number(record.update_time || 0),
+                  updateTime: normUpdateTime(record.update_time),
                   voiceName: String(record.voice_name || ''),
                   hasWav: record.has_wav === true,
                   hasSrt: record.has_srt === true
@@ -1972,6 +1985,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             var taskText = String(task?.text || '').replace(/\s+/g, ' ').trim();
             var expectedVoice = String(task?.voiceName || task?.voiceId || '').trim().toLowerCase().replace(/\s+/g, ' ');
             var submittedAt = Number(task?.submittedAt || 0);
+            var normUpdateTime = function(raw) {
+              var n = Number(raw || 0);
+              if (n && n < 1e12) n *= 1000;
+              return n;
+            };
 
             while (Date.now() - startedAt < maxWait) {
               var list = capture.snapshot?.data?.audio_list;
@@ -1979,7 +1997,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 var candidates = list.filter(function(item) {
                   var itemText = String(item.text || '').replace(/\s+/g, ' ').trim();
                   if (!taskText || itemText !== taskText) return false;
-                  if (submittedAt && Number(item.update_time || 0) < submittedAt) return false;
+                  if (submittedAt && normUpdateTime(item.update_time) < submittedAt) return false;
                   var actualVoice = String(item.voice_name || '').trim().toLowerCase().replace(/\s+/g, ' ');
                   if (!expectedVoice) return true;
                   if (!actualVoice) return false;
@@ -1988,7 +2006,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     || actualVoice.indexOf(expectedVoice + ' -') === 0;
                 });
                 candidates.sort(function(a, b) {
-                  return Number(b.update_time || 0) - Number(a.update_time || 0);
+                  return normUpdateTime(b.update_time) - normUpdateTime(a.update_time);
                 });
                 var record = candidates.find(function(item) {
                   return Number(item.status) === 0 && !!item.audio_url;
@@ -2000,7 +2018,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                       audioId: String(record.audio_id || ''),
                       status: Number(record.status),
                       audioUrl: String(record.audio_url || ''),
-                      updateTime: Number(record.update_time || 0),
+                      updateTime: normUpdateTime(record.update_time),
                       voiceName: String(record.voice_name || '')
                     }
                   };
@@ -2503,7 +2521,7 @@ async function resolveSubmissionRecovery(tabId) {
   }
   if (!parallelBatchState.isRunning && parallelBatchState.runId) {
     const secondaryTabId = parallelBatchState.secondaryTabId;
-    parallelBatchState = getDefaultParallelBatchState();
+    parallelBatchState = __pb_getDefaultState();
     await saveParallelBatchState();
     await closeTabSafely(secondaryTabId);
   }
@@ -2691,10 +2709,12 @@ async function submitLongTextEntries(entries, tabId) {
       task.submissionPhase = null;
       task.reservedAt = null;
       task.dispatchedAt = null;
+      DiagLog.info('longText', 'Long Text submit start', { localId: task.localId, voiceId: task.voiceId, voiceName: task.selectedVoiceName, language: task.language, textLength: String(task.text || '').length });
       await saveLongTextState();
       broadcastLongTextProgress();
 
       try {
+        const dynamicTimeout = Math.max(120000, Math.ceil(String(task.text || '').length / 1000) * 1500 + 30000);
         const response = await sendTabMessageWithTimeout(tabId, {
           action: 'submitLongText',
           task: {
@@ -2704,7 +2724,7 @@ async function submitLongTextEntries(entries, tabId) {
             voiceName: task.selectedVoiceName,
             language: task.language
           }
-        }, 120000);
+        }, dynamicTimeout);
         if (!response?.success) {
           if (task.submissionPhase === 'dispatched') {
             task.status = 'awaiting_match';
@@ -2715,6 +2735,7 @@ async function submitLongTextEntries(entries, tabId) {
             task.status = 'error';
             task.error = response?.reason || 'long_text_submit_failed';
             if (task.submissionPhase === 'rejected') terminalFailure = task.error;
+            DiagLog.error('longText', 'Long Text submit failed', { localId: task.localId, phase: task.submissionPhase, error: task.error });
           }
         } else {
           task.submittedAt = response.submittedAt || Date.now();
@@ -2755,6 +2776,7 @@ async function submitLongTextEntries(entries, tabId) {
         task.error = error.message;
         reconciliationRequired = wasDispatched;
         if (task.submissionPhase === 'rejected') terminalFailure = task.error;
+        DiagLog.error('longText', 'Long Text submit failed', { localId: task.localId, phase: task.submissionPhase, error: task.error });
       }
 
       await saveLongTextState();
@@ -2897,7 +2919,10 @@ async function downloadReadyLongTextTask(task) {
 
 async function pollLongTextTasks() {
   await Promise.all([loadLongTextState(), loadBatchState(), loadParallelBatchState()]);
-  if (longTextState.isSubmitting) return;
+  if (longTextState.isSubmitting) {
+    DiagLog.warn('longText', 'Long Text poll skipped: submission in progress', { activeTaskCount: longTextState.tasks.filter((t) => ['awaiting_match', 'pending', 'ready', 'downloading'].includes(t.status)).length });
+    return;
+  }
 
   const activeTasks = longTextState.tasks.filter((task) => {
     return ['awaiting_match', 'pending', 'ready', 'downloading'].includes(task.status);
@@ -2907,13 +2932,17 @@ async function pollLongTextTasks() {
     return;
   }
 
-  const tabId = await findLongTextMonitorTab();
-  if (!tabId) return;
-  longTextState.monitorTabId = tabId;
-
   const pendingTasks = activeTasks.filter((task) => {
     return task.status === 'awaiting_match' || task.status === 'pending';
   });
+  const tabId = await findLongTextMonitorTab();
+  if (!tabId) {
+    DiagLog.warn('longText', 'Long Text poll skipped: no MiniMax tab', { activeTaskCount: pendingTasks.length, tasksNeedingMatch: pendingTasks.filter((t) => t.status === 'awaiting_match' || t.status === 'pending').length });
+    return;
+  }
+  longTextState.monitorTabId = tabId;
+
+  const modifiedTasks = new Map();
   if (pendingTasks.length > 0) {
     const claimedAudioIds = longTextState.tasks.map((task) => task.audioId).filter(Boolean);
     const response = await sendTabMessageWithTimeout(tabId, {
@@ -2929,23 +2958,45 @@ async function pollLongTextTasks() {
         excludedAudioIds: [...(longTextState.baselineAudioIds || []), ...claimedAudioIds]
       }))
     }, 30000);
-    if (!response?.success) throw new Error(response?.reason || 'long_text_history_poll_failed');
+    if (!response?.success) {
+      DiagLog.warn('longText', 'Long Text History poll failed', { reason: response?.reason || 'unknown', taskLocalIds: pendingTasks.map((t) => t.localId) });
+      throw new Error(response?.reason || 'long_text_history_poll_failed');
+    }
+
+    await loadLongTextState();
+    longTextState.monitorTabId = tabId;
 
     (response.matches || []).forEach((match) => {
       const task = longTextState.tasks.find((item) => item.localId === match.localId);
       if (!task) return;
       task.pollAttempts = Number(task.pollAttempts || 0) + 1;
-      if (match.record) applyLongTextHistoryRecord(task, match.record);
+      if (match.record) {
+        applyLongTextHistoryRecord(task, match.record);
+      } else {
+        DiagLog.warn('longText', 'Long Text history match pending', {
+          localId: task.localId,
+          textLength: String(task.text || '').length,
+          voiceName: task.selectedVoiceName,
+          voiceId: task.voiceId,
+          submittedAt: task.submittedAt,
+          ambiguous: match.ambiguous === true,
+          candidateCount: Array.isArray(match.candidateAudioIds) ? match.candidateAudioIds.length : 0,
+          candidateAudioIds: match.candidateAudioIds || [],
+          pollAttempts: task.pollAttempts
+        });
+      }
       const submittedAt = Number(task.submittedAt || 0);
       if (!match.record && submittedAt && Date.now() - submittedAt > 24 * 60 * 60 * 1000) {
         task.status = 'reconciliation_required';
         task.error = 'Long Text task is still unresolved after 24 hours; manual reconciliation is required';
       }
+      modifiedTasks.set(task.localId, { ...task });
     });
   }
 
   for (const task of longTextState.tasks.filter((item) => item.status === 'downloading')) {
     await confirmLongTextDownload(task);
+    modifiedTasks.set(task.localId, { ...task });
   }
   for (const task of longTextState.tasks.filter((item) => item.status === 'ready')) {
     try {
@@ -2954,17 +3005,26 @@ async function pollLongTextTasks() {
       task.status = 'ready';
       task.error = error.message;
     }
+    modifiedTasks.set(task.localId, { ...task });
   }
 
+  await loadLongTextState();
+  longTextState.monitorTabId = tabId;
+  for (const [localId, snapshot] of modifiedTasks) {
+    const task = longTextState.tasks.find((item) => item.localId === localId);
+    if (!task) continue;
+    Object.assign(task, snapshot);
+  }
   await saveLongTextState();
   await stopLongTextAlarmIfIdle();
   broadcastLongTextProgress();
 }
 
 // SYNC:parallel_batch — реализация в parallel_batch.js (importScripts выше).
-const getDefaultParallelBatchState = parallel_batch.getDefaultParallelBatchState;
+// Локальные алиасы с префиксом __pb_, чтобы не конфликтовать с глобалами из importScripts.
+const __pb_getDefaultState = parallel_batch.getDefaultParallelBatchState;
 
-let parallelBatchState = getDefaultParallelBatchState();
+let parallelBatchState = __pb_getDefaultState();
 let parallelOperationQueue = Promise.resolve();
 
 function queueParallelOperation(operation) {
@@ -2975,7 +3035,7 @@ function queueParallelOperation(operation) {
 
 async function loadParallelBatchState() {
   const data = await chrome.storage.local.get('parallelBatchState');
-  parallelBatchState = data.parallelBatchState || getDefaultParallelBatchState();
+  parallelBatchState = data.parallelBatchState || __pb_getDefaultState();
   return parallelBatchState;
 }
 
@@ -3007,10 +3067,10 @@ function annotateParallelJobs(jobs) {
 }
 
 // SYNC:parallel_batch — реализация в parallel_batch.js.
-const buildParallelPlan = parallel_batch.buildParallelPlan;
+const __pb_buildPlan = parallel_batch.buildParallelPlan;
 
 // SYNC:parallel_batch — реализация в parallel_batch.js.
-const getParallelQueueSnapshot = parallel_batch.getParallelQueueSnapshot;
+const __pb_getQueueSnapshot = parallel_batch.getParallelQueueSnapshot;
 
 async function waitForParallelTab(tabId, timeoutMs = 30000) {
   const startedAt = Date.now();
@@ -3113,18 +3173,38 @@ async function assertDirectTtsCapability(tabId) {
 
 function getParallelProgress() {
   const workers = parallelBatchState.workers || [];
+  const workerSummaries = workers.map(parallel_batch.getParallelWorkerSummary);
   const completedIds = workers.flatMap((worker) => (worker.queue || [])
     .filter((entry) => entry.status === 'completed' || entry.downloadConfirmed)
     .map((entry) => entry.id));
-  const currentIndex = workers.reduce((sum, worker) => sum + Number(worker.currentIndex || 0), 0);
-  const total = workers.reduce((sum, worker) => sum + Number(worker.total || 0), 0);
+  const currentIndex = workerSummaries.reduce((sum, worker) => sum + worker.currentIndex, 0);
+  const total = workerSummaries.reduce((sum, worker) => sum + worker.total, 0);
+  const completed = workerSummaries.reduce((sum, worker) => sum + worker.completed, 0);
+  const errors = workerSummaries.reduce((sum, worker) => sum + worker.errors, 0);
   return {
     currentIndex,
     total,
+    completed,
+    errors,
     completedIds,
     isRunning: parallelBatchState.isRunning,
     isPaused: parallelBatchState.isPaused,
-    workerCount: workers.length
+    workerCount: workers.length,
+    workers: workerSummaries
+  };
+}
+
+function getParallelBatchDisplayState() {
+  const progress = getParallelProgress();
+  return {
+    runId: parallelBatchState.runId,
+    phase: parallelBatchState.phase || 'idle',
+    isRunning: parallelBatchState.isRunning === true,
+    isPaused: parallelBatchState.isPaused === true,
+    isFallingBack: parallelBatchState.isFallingBack === true,
+    error: parallelBatchState.error || null,
+    startedAt: parallelBatchState.startedAt || null,
+    progress
   };
 }
 
@@ -3135,12 +3215,7 @@ async function broadcastParallelProgress() {
     action: 'parallelBatchProgress',
     runId: parallelBatchState.runId,
     progress,
-    workers: parallelBatchState.workers.map((worker) => ({
-      workerId: worker.workerId,
-      currentIndex: worker.currentIndex,
-      total: worker.total,
-      status: worker.status
-    }))
+    workers: progress.workers
   }).catch(() => {});
 }
 
@@ -3160,7 +3235,7 @@ async function finishParallelBatch() {
       status: worker.status
     }))
   });
-  parallelBatchState = getDefaultParallelBatchState();
+  parallelBatchState = __pb_getDefaultState();
   await saveParallelBatchState();
   await chrome.alarms.clear('parallelBatchWatchdog');
   await closeTabSafely(secondaryTabId);
@@ -3217,7 +3292,7 @@ async function fallbackParallelBatch(reason) {
   }
 
   const remainingJobs = buildRemainingParallelJobs();
-  parallelBatchState = getDefaultParallelBatchState();
+  parallelBatchState = __pb_getDefaultState();
   await saveParallelBatchState();
   await chrome.alarms.clear('parallelBatchWatchdog');
   await closeTabSafely(secondaryTabId);
@@ -3266,6 +3341,10 @@ async function updateParallelWorker(request, sender, isComplete = false) {
   await broadcastParallelProgress();
 
   if (!isComplete) return;
+  if (isComplete && request.success === false) {
+    await fallbackParallelBatch(request.error || 'Worker reported failure');
+    return;
+  }
   const hasErrors = worker.queue.some((entry) => entry.status === 'error');
   if (hasErrors) {
     await fallbackParallelBatch('Один из потоков завершился с ошибкой');
@@ -3292,7 +3371,7 @@ async function prepareParallelBatchProcessing(jobs, primaryTabId) {
     secondaryTab = await chrome.tabs.create({ url: MINIMAX_TTS_URL, active: false });
     const runId = `parallel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     parallelBatchState = {
-      ...getDefaultParallelBatchState(),
+      ...__pb_getDefaultState(),
       phase: 'preparing',
       runId,
       primaryTabId,
@@ -3337,7 +3416,7 @@ async function prepareParallelBatchProcessing(jobs, primaryTabId) {
     return { runId, originalJobs, secondaryTab, workers };
   } catch (error) {
     await closeTabSafely(secondaryTab?.id);
-    parallelBatchState = getDefaultParallelBatchState();
+    parallelBatchState = __pb_getDefaultState();
     await saveParallelBatchState();
     throw error;
   }
@@ -3348,7 +3427,7 @@ async function discardPreparedParallelBatch(prepared) {
   await loadParallelBatchState();
   if (parallelBatchState.phase !== 'preparing') return;
   if (prepared?.runId && parallelBatchState.runId !== prepared.runId) return;
-  parallelBatchState = getDefaultParallelBatchState();
+  parallelBatchState = __pb_getDefaultState();
   await saveParallelBatchState();
 }
 
@@ -3410,7 +3489,7 @@ async function startParallelBatchProcessing(jobs, primaryTabId, prepared = null)
       }
       await chrome.alarms.clear('parallelBatchWatchdog');
       if (unconfirmedWorkers.length === 0) {
-        parallelBatchState = getDefaultParallelBatchState();
+        parallelBatchState = __pb_getDefaultState();
         await saveParallelBatchState();
         await closeTabSafely(secondaryTabId);
       } else {
@@ -3426,7 +3505,17 @@ async function startParallelBatchProcessing(jobs, primaryTabId, prepared = null)
   }
 }
 
-chrome.alarms.onAlarm.addListener((alarm) => {
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === 'legacyBatchWatchdog') {
+    await chrome.alarms.clear('legacyBatchWatchdog');
+    await loadBatchState();
+    if (batchState.isRunning && !batchState.activeJob && Array.isArray(batchState.queue) && batchState.queue.length > 0) {
+      queueLegacyBatchOperation(() => processNextBatchItemLocked()).catch((error) => {
+        console.error('[Background] Legacy batch watchdog recovery failed:', error);
+      });
+    }
+    return;
+  }
   if (alarm.name !== 'parallelBatchWatchdog') return;
   queueParallelOperation(async () => {
     await loadParallelBatchState();
@@ -3461,16 +3550,28 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   queueParallelOperation(async () => {
-    await loadParallelBatchState();
-    if (!parallelBatchState.isRunning) return;
-    if (!parallelBatchState.workers.some((worker) => worker.tabId === tabId)) return;
+    await Promise.all([loadParallelBatchState(), loadBatchState()]);
+    if (parallelBatchState.isRunning) {
+      if (!parallelBatchState.workers.some((worker) => worker.tabId === tabId)) return;
 
-    if (tabId === parallelBatchState.primaryTabId && parallelBatchState.secondaryTabId) {
-      parallelBatchState.primaryTabId = parallelBatchState.secondaryTabId;
-      parallelBatchState.secondaryTabId = null;
-      await saveParallelBatchState();
+      if (tabId === parallelBatchState.primaryTabId && parallelBatchState.secondaryTabId) {
+        parallelBatchState.primaryTabId = parallelBatchState.secondaryTabId;
+        parallelBatchState.secondaryTabId = null;
+        await saveParallelBatchState();
+      }
+      await fallbackParallelBatch('Одна из рабочих вкладок была закрыта');
+      return;
     }
-    await fallbackParallelBatch('Одна из рабочих вкладок была закрыта');
+    if (tabId === batchState.activeTabId) {
+      batchState.isRunning = false;
+      batchState.recoveryRequired = true;
+      batchState.error = 'MiniMax tab closed during batch';
+      await saveBatchState();
+      chrome.runtime.sendMessage({
+        action: 'automationError',
+        error: 'MiniMax tab closed during batch'
+      }).catch(() => {});
+    }
   }).catch((error) => console.error('[Background] Parallel tab close handling failed:', error));
 });
 
@@ -3583,7 +3684,6 @@ async function startLongTextAwareBatch(jobs, tabId, useParallel) {
   if (parallelBatchState.runId) {
     return { success: false, reason: 'parallel_batch_reconciliation_required' };
   }
-  await assertDirectTtsCapability(tabId);
   const unresolvedRegularSubmissions = await reconcileRegularSubmissionLedger(tabId);
   if (unresolvedRegularSubmissions.length > 0) {
     return { success: false, reason: 'regular_submission_reconciliation_required' };
@@ -3656,6 +3756,15 @@ queueLongTextSubmission(() => initializeLongTextState()).catch((error) => {
 
 // Слушаем команды от POPUP и CONTENT SCRIPT
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === 'getParallelBatchStatus') {
+    queueParallelOperation(async () => {
+      await loadParallelBatchState();
+      return getParallelBatchDisplayState();
+    }).then((state) => sendResponse({ success: true, state }))
+      .catch((error) => sendResponse({ success: false, reason: error.message }));
+    return true;
+  }
+
   if (request.action === 'getSubmissionRecoveryStatus') {
     Promise.all([loadBatchState(), loadParallelBatchState()])
       .then(() => getSubmissionRecoverySummary())
@@ -3884,7 +3993,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         (item.queue || []).some((queuedEntry) => queuedEntry.paidSubmissionStarted && !queuedEntry.downloadConfirmed)
       ));
       if (!parallelBatchState.isRunning && !hasUnresolvedPaid) {
-        parallelBatchState = getDefaultParallelBatchState();
+        parallelBatchState = __pb_getDefaultState();
       }
       await saveParallelBatchState();
       return { success: true };
@@ -4008,6 +4117,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             console.error('[Background] Legacy next item failed:', error);
           });
         }, 3000);
+        chrome.alarms.create('legacyBatchWatchdog', { delayInMinutes: 0.5 });
       }
     }).catch((error) => console.error('[Background] Legacy completion failed:', error));
   }
@@ -4086,7 +4196,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           parallelBatchState.isPaused = false;
           parallelBatchState.error = 'Stopped with paid submissions awaiting History reconciliation';
         } else {
-          parallelBatchState = getDefaultParallelBatchState();
+          parallelBatchState = __pb_getDefaultState();
         }
         await saveParallelBatchState();
         await chrome.alarms.clear('parallelBatchWatchdog');

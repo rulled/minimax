@@ -74,7 +74,7 @@ function parseMarkdown(markdownText) {
     downloadIndex: null
   };
 
-  const headerRegex = /^(?:\\)?\*\*(?:\\)?\*?(.+?)(?:\\)?\*?(?:\\)?\*\*(?:\s*:)?(.*)$/;
+  const headerRegex = /^(?:\\)?\*\*(?:\\)?\*?(.+?)(?:\\)?\*?(?:\\)?(?::\*\*|\*\*\s*:)(.*)$/;
 
   function finalizeCurrentEntry() {
     if (!currentEntry || !currentEntry.text.trim()) return;

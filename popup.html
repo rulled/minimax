@@ -810,6 +810,109 @@
       display: none;
     }
 
+    .parallel-progress-card {
+      display: none;
+      gap: 10px;
+      margin-top: 2px;
+    }
+
+    .parallel-progress-card.visible { display: flex; }
+
+    .parallel-progress-summary {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 11px;
+      color: var(--md-sys-color-on-surface-variant);
+    }
+
+    .parallel-progress-track {
+      height: 6px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: var(--md-sys-color-surface-variant);
+    }
+
+    .parallel-progress-fill {
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--md-sys-color-primary), var(--md-sys-color-secondary));
+      transition: width 0.25s ease;
+    }
+
+    .parallel-workers-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .parallel-worker-card {
+      min-width: 0;
+      padding: 10px;
+      border: 1px solid var(--md-sys-color-outline);
+      border-radius: var(--radius-sm);
+      background: rgba(14, 16, 18, 0.72);
+    }
+
+    .parallel-worker-heading,
+    .parallel-worker-metrics {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+
+    .parallel-worker-heading {
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .parallel-worker-status {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 10px;
+      color: var(--md-sys-color-primary);
+    }
+
+    .parallel-worker-voice,
+    .parallel-worker-speaker,
+    .parallel-worker-preview {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .parallel-worker-voice {
+      margin-top: 9px;
+      font-size: 10px;
+      color: var(--md-sys-color-secondary);
+    }
+
+    .parallel-worker-speaker {
+      margin-top: 4px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    .parallel-worker-preview {
+      margin-top: 3px;
+      font-size: 10px;
+      color: var(--md-sys-color-on-surface-variant);
+    }
+
+    .parallel-worker-metrics {
+      margin-top: 10px;
+      font-size: 10px;
+      color: var(--md-sys-color-on-surface-variant);
+    }
+
+    .parallel-worker-error { color: var(--md-sys-color-error); }
+
+    @media (max-width: 330px) {
+      .parallel-workers-grid { grid-template-columns: 1fr; }
+    }
+
     .status-success {
       background: rgba(15, 118, 110, 0.1);
       color: var(--md-sys-color-primary);
@@ -1156,6 +1259,13 @@
         </div>
 
         <p id="multiStatus" style="opacity: 0; transition: opacity 0.3s;"></p>
+        <section id="parallelProgressCard" class="card parallel-progress-card" aria-live="polite">
+          <div class="card-title">2 потока</div>
+          <div id="parallelProgressSummary" class="parallel-progress-summary"></div>
+          <div class="parallel-progress-track"><div id="parallelProgressFill" class="parallel-progress-fill"></div></div>
+          <div id="parallelWorkersGrid" class="parallel-workers-grid"></div>
+          <div id="parallelTerminalReason" class="voice-source-status"></div>
+        </section>
         <div id="multiSkippedReportArea"></div>
         <div id="multiLongTextStatusArea" class="info-banner" style="display: none;"></div>
       </div>

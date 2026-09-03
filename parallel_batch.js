@@ -95,6 +95,11 @@ function getParallelQueueSnapshot(queue) {
   return (Array.isArray(queue) ? queue : []).map((entry) => ({
     _parallelKey: entry._parallelKey,
     id: entry.id,
+    speaker: String(entry.speaker || ''),
+    voiceName: String(entry.voiceName || entry.voiceId || ''),
+    // `preview` is produced by parser.js; keep it bounded so the persisted
+    // state remains display-safe and never carries the full source text.
+    preview: String(entry.preview || '').slice(0, 160),
     status: entry.status || 'pending',
     downloadConfirmed: entry.downloadConfirmed === true,
     paidSubmissionStarted: entry.paidSubmissionStarted === true,
@@ -102,6 +107,38 @@ function getParallelQueueSnapshot(queue) {
     submittedAt: Number(entry.submittedAt || 0),
     error: entry.error || null
   }));
+}
+
+/**
+ * Display-safe worker summary for the popup. It intentionally reads only the
+ * redacted worker queue persisted by getParallelQueueSnapshot().
+ */
+function getParallelWorkerSummary(worker) {
+  const queue = Array.isArray(worker?.queue) ? worker.queue : [];
+  const total = Number(worker?.total || queue.length) || queue.length;
+  const currentIndex = Math.max(0, Number(worker?.currentIndex || 0));
+  const currentEntry = currentIndex < queue.length ? queue[currentIndex] : null;
+  const completed = queue.filter((entry) => (
+    entry.status === 'completed' || entry.downloadConfirmed === true
+  )).length;
+  const errors = queue.filter((entry) => entry.status === 'error').length;
+
+  return {
+    workerId: worker?.workerId || '',
+    status: worker?.status || 'pending',
+    currentIndex,
+    total,
+    completed,
+    errors,
+    currentEntry: currentEntry ? {
+      id: currentEntry.id,
+      speaker: currentEntry.speaker || '',
+      voiceName: currentEntry.voiceName || '',
+      preview: String(currentEntry.preview || '').slice(0, 160),
+      status: currentEntry.status || 'pending',
+      error: currentEntry.error || null
+    } : null
+  };
 }
 
 /**
@@ -130,7 +167,8 @@ function buildRemainingFromWorkers(workers, originalJobs) {
   const protectedKeys = new Set((workers || []).flatMap((worker) => {
     return (worker.queue || [])
       .filter(isEntryProtected)
-      .map((entry) => entry._parallelKey);
+      .map((entry) => entry._parallelKey)
+      .filter((key) => key != null);
   }));
 
   return (originalJobs || [])
@@ -148,6 +186,7 @@ const __pbExports = {
   getDefaultParallelBatchState,
   buildParallelPlan,
   getParallelQueueSnapshot,
+  getParallelWorkerSummary,
   isEntryProtected,
   buildRemainingFromWorkers
 };

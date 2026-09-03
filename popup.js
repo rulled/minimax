@@ -162,6 +162,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   const multiLongTextStatusArea = document.getElementById('multiLongTextStatusArea');
   const parallelModeToggle = document.getElementById('parallelModeToggle');
   const parallelModeStatus = document.getElementById('parallelModeStatus');
+  const parallelProgressCard = document.getElementById('parallelProgressCard');
+  const parallelProgressSummary = document.getElementById('parallelProgressSummary');
+  const parallelProgressFill = document.getElementById('parallelProgressFill');
+  const parallelWorkersGrid = document.getElementById('parallelWorkersGrid');
+  const parallelTerminalReason = document.getElementById('parallelTerminalReason');
 
   // Батч элементы
   const batchFilesCounter_Single = document.getElementById('batchFilesCounter_Single');
@@ -1063,20 +1068,24 @@ document.addEventListener('DOMContentLoaded', async () => {
       batchFiles_Single = [];
       parsedEntries = [];
       for (let i = 0; i < fileArray.length; i++) {
-        const text = await fileArray[i].text();
-        const entries = parseMarkdownText(text);
-        const metadata = extractScriptMetadata(text, fileArray[i].name);
-        const displayName = buildDisplayFileName(fileArray[i].name, metadata.scriptName);
-        if (entries.length) {
-          batchFiles_Single.push({
-            name: displayName,
-            scriptName: metadata.scriptName,
-            entries: entries,
-            selectedSpeaker: null,
-            excludedIds: new Set(),
-            languageCode: metadata.languageCode || '',
-            minimaxLanguage: metadata.minimaxLanguage || ''
-          });
+        try {
+          const text = await fileArray[i].text();
+          const entries = parseMarkdownText(text);
+          const metadata = extractScriptMetadata(text, fileArray[i].name);
+          const displayName = buildDisplayFileName(fileArray[i].name, metadata.scriptName);
+          if (entries.length) {
+            batchFiles_Single.push({
+              name: displayName,
+              scriptName: metadata.scriptName,
+              entries: entries,
+              selectedSpeaker: null,
+              excludedIds: new Set(),
+              languageCode: metadata.languageCode || '',
+              minimaxLanguage: metadata.minimaxLanguage || ''
+            });
+          }
+        } catch (error) {
+          showStatus('Ошибка чтения файла: ' + (fileArray[i]?.name || 'неизвестно') + ' — ' + error.message, 'error');
         }
       }
       if (batchFiles_Single.length === 0) return showStatus('Реплики не найдены', 'error');
@@ -2124,11 +2133,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       const activeTabId = await getMinimaxTabId();
       if (!activeTabId) return showStatus('Откройте MiniMax TTS', 'error');
       try {
-          const mappingInspection = await inspectVoiceMappingPlan();
-          if (!mappingInspection.valid) {
-              const t = mappingInspection.totals || {};
-              showStatus(`Внимание: voice mapping неполный (missing ${t.missing || 0}, stale ${t.stale || 0}). Генерируются только реплики с голосом.`, 'warning');
-          }
           await preflightQueueVoices(batchJobs, activeTabId);
           await preflightGenerationCredit(batchJobs, activeTabId);
       } catch (error) {
@@ -2294,6 +2298,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       }).catch((error) => ({ success: false, reason: error?.message || 'pause_failed' }));
       if (!response?.success) {
           showStatus(`Не удалось изменить паузу: ${response?.reason || 'unknown error'}`, 'error');
+          resetUI();
           return;
       }
       pauseAutomationButton.textContent = response.isPaused ? 'Продолжить' : 'Пауза';
@@ -2305,6 +2310,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       }));
       if (!response?.success) {
           showStatus(`Не удалось остановить: ${response?.reason || 'unknown error'}`, 'error');
+          resetUI();
           return;
       }
       resetUI();
@@ -2360,6 +2366,102 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
   };
 
+  function getParallelStatusLabel(status) {
+      const labels = {
+          preparing: 'подготовка',
+          running: 'генерация',
+          complete: 'готово',
+          stopped: 'остановлен',
+          error: 'ошибка',
+          pending: 'ожидание'
+      };
+      return labels[status] || status || 'ожидание';
+  }
+
+  function addParallelWorkerText(parent, className, text) {
+      const element = document.createElement('div');
+      element.className = className;
+      element.textContent = text || '—';
+      parent.appendChild(element);
+  }
+
+  function renderParallelWorkerCard(worker, index) {
+      const card = document.createElement('div');
+      card.className = 'parallel-worker-card';
+      const heading = document.createElement('div');
+      heading.className = 'parallel-worker-heading';
+      const title = document.createElement('span');
+      title.textContent = `Поток ${index + 1}`;
+      const state = document.createElement('span');
+      state.className = 'parallel-worker-status';
+      state.textContent = getParallelStatusLabel(worker.status);
+      heading.append(title, state);
+      card.appendChild(heading);
+
+      const current = worker.currentEntry || null;
+      addParallelWorkerText(card, 'parallel-worker-voice', current?.voiceName || 'голос не выбран');
+      addParallelWorkerText(card, 'parallel-worker-speaker', current?.speaker || (worker.status === 'complete' ? 'очередь завершена' : 'ожидание реплики'));
+      addParallelWorkerText(card, 'parallel-worker-preview', current?.preview || current?.error || '');
+
+      const metrics = document.createElement('div');
+      metrics.className = 'parallel-worker-metrics';
+      const position = document.createElement('span');
+      const currentNumber = Math.min(Number(worker.currentIndex || 0) + 1, Number(worker.total || 0));
+      position.textContent = `${currentNumber} / ${worker.total || 0}`;
+      const result = document.createElement('span');
+      result.textContent = `✓ ${worker.completed || 0}`;
+      if (worker.errors) {
+          result.textContent += ` · ! ${worker.errors}`;
+          result.className = 'parallel-worker-error';
+      }
+      metrics.append(position, result);
+      card.appendChild(metrics);
+      return card;
+  }
+
+  function hideParallelProgress() {
+      if (!parallelProgressCard) return;
+      parallelProgressCard.classList.remove('visible');
+      parallelWorkersGrid.replaceChildren();
+      parallelProgressSummary.replaceChildren();
+      parallelTerminalReason.textContent = '';
+      parallelProgressFill.style.width = '0%';
+  }
+
+  function renderParallelProgress(state) {
+      if (!parallelProgressCard || !state?.runId) {
+          hideParallelProgress();
+          return;
+      }
+      const progress = state.progress || {};
+      const total = Number(progress.total || 0);
+      const completed = Number(progress.completed || 0);
+      const errors = Number(progress.errors || 0);
+      const current = Number(progress.currentIndex || 0);
+      const percentage = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0;
+      parallelProgressCard.classList.add('visible');
+      parallelProgressSummary.replaceChildren();
+      const phase = document.createElement('span');
+      phase.textContent = state.isRunning
+          ? (state.isPaused ? 'приостановлено' : 'в работе')
+          : getParallelStatusLabel(state.phase);
+      const summary = document.createElement('span');
+      summary.textContent = `${Math.min(current, total)} / ${total} · ✓ ${completed}${errors ? ` · ! ${errors}` : ''}`;
+      parallelProgressSummary.append(phase, summary);
+      parallelProgressFill.style.width = `${percentage}%`;
+      parallelWorkersGrid.replaceChildren();
+      (Array.isArray(progress.workers) ? progress.workers : []).forEach((worker, index) => {
+          parallelWorkersGrid.appendChild(renderParallelWorkerCard(worker, index));
+      });
+      parallelTerminalReason.textContent = state.isRunning ? '' : (state.error || 'Параллельный пакет остановлен.');
+      parallelTerminalReason.className = `voice-source-status${state.error ? ' error' : ''}`;
+  }
+
+  async function refreshParallelProgress() {
+      const response = await chrome.runtime.sendMessage({ action: 'getParallelBatchStatus' }).catch(() => null);
+      if (response?.success) renderParallelProgress(response.state);
+  }
+
   // ============================================
   // 8. СООБЩЕНИЯ
   // ============================================
@@ -2371,13 +2473,22 @@ document.addEventListener('DOMContentLoaded', async () => {
       else if (msg.action === 'parallelBatchProgress') {
           const progress = msg.progress || {};
           applyCompletedCards(progress.completedIds);
+          renderParallelProgress({
+              runId: msg.runId,
+              isRunning: progress.isRunning,
+              isPaused: progress.isPaused,
+              phase: progress.isRunning ? 'running' : 'stopped',
+              progress
+          });
           renderRunningProgress(progress.currentIndex || 0, progress.total || 0, true);
           pauseAutomationButton.textContent = progress.isPaused ? 'Продолжить' : 'Пауза';
       }
       else if (msg.action === 'parallelBatchFallback') {
+          refreshParallelProgress();
           showStatus(`2 потока отключены: ${msg.reason}. Осталось: ${msg.remaining}`, 'info');
       }
       else if (msg.action === 'parallelBatchComplete') {
+          hideParallelProgress();
           document.querySelectorAll('.preview-card').forEach(c => c.classList.remove('processing'));
           loadSkippedEntries();
           showStatus('Готово в 2 потока!', 'success');
@@ -2428,14 +2539,29 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   async function restoreAutomationState() {
-      const [res, batchStatus, longTextStatus] = await Promise.all([
+      const [res, batchStatus, longTextStatus, parallelStatus] = await Promise.all([
           chrome.runtime.sendMessage({action: 'getAutomationState'}).catch(() => null),
           chrome.runtime.sendMessage({action: 'getBatchStatus'}).catch(() => null),
-          chrome.runtime.sendMessage({action: 'getLongTextStatus'}).catch(() => null)
+          chrome.runtime.sendMessage({action: 'getLongTextStatus'}).catch(() => null),
+          chrome.runtime.sendMessage({action: 'getParallelBatchStatus'}).catch(() => null)
       ]);
+      if (parallelStatus?.success && parallelStatus.state?.runId) {
+          renderParallelProgress(parallelStatus.state);
+      }
       renderLongTextStatus(longTextStatus?.summary);
       const state = res?.state;
-      if (!state) return false;
+      if (!state) {
+          const persisted = await chrome.storage.local.get(['batchState', 'parallelBatchState', 'longTextState']);
+          const batchRunning = !!persisted.batchState?.isRunning;
+          const parallelRunning = !!persisted.parallelBatchState?.isRunning;
+          const longTextRunning = !!persisted.longTextState?.isSubmitting;
+          if (batchRunning || parallelRunning || longTextRunning) {
+              showStatus('Автоматизация активна в фоне после перезапуска сервис-воркера. Управление — на вкладке MiniMax.', 'info');
+              setRunningState();
+              return true;
+          }
+          return false;
+      }
 
       if (Array.isArray(state.parsedEntries)) parsedEntries = state.parsedEntries;
       if (Array.isArray(state.excludedIds)) excludedIds = new Set(state.excludedIds);

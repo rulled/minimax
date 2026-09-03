@@ -38,8 +38,8 @@
     try {
       if (typeof chrome !== 'undefined' && chrome.runtime?.id) {
         if (typeof window === 'undefined' && typeof document === 'undefined') return 'sw';
-        if (typeof document !== 'undefined' && document.getElementById('popupRoot')) return 'popup';
-        return 'popup';
+        if (typeof location !== 'undefined' && location.protocol === 'chrome-extension:') return 'popup';
+        return 'content';
       }
     } catch (_) { /* не extension-контекст */ }
     if (typeof document !== 'undefined') return 'content';
@@ -121,8 +121,11 @@
   }
 
   async function clear() {
-    pending = [];
-    await chrome.storage.local.set({ [STORAGE_KEY]: [] });
+    writeChain = writeChain.then(() => {
+      pending = [];
+      return chrome.storage.local.set({ [STORAGE_KEY]: [] });
+    });
+    await writeChain;
   }
 
   function stats() {

@@ -108,7 +108,7 @@ function computeStateSignature(params) {
 
 // Shared lookup table for hex char -> nibble value (0..15), 255 = invalid.
 const HEX_NIBBLE = (function () {
-  const t = new Uint8Array(128).fill(255);
+  const t = new Uint8Array(256).fill(255);
   const hex = '0123456789abcdefABCDEF';
   for (let i = 0; i < hex.length; i += 1) {
     t[hex.charCodeAt(i)] = i < 16 ? i : i - 6;
