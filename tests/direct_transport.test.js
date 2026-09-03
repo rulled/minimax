@@ -5,6 +5,8 @@ const {
   computeStateSignature,
   decodeHexAudio,
   findMpegFrameOffset,
+  containsRiffWavBlock,
+  isMp3Head,
   isValidMp3,
   buildAudioDataUrl
 } = require('../direct_transport');
@@ -159,6 +161,61 @@ test('isValidMp3 skips ID3v2 tag and finds the frame after it', () => {
 test('isValidMp3 rejects a payload with no frame sync', () => {
   const bytes = new Uint8Array(1200).fill(0);
   assert.equal(isValidMp3(bytes), false);
+});
+
+// ---------- RIFF/WAV glue regression (corrupted downloads) ----------
+
+test('containsRiffWavBlock detects a WAV glued onto the MP3 stream', () => {
+  // Regression: status:1 MP3 chunks followed by the status:2 full-WAV frame
+  // glued into one payload produced "MP3 + WAV" files that strict demuxers
+  // reject. The status filter prevents the glue; this scan is the net.
+  const bytes = new Uint8Array(2100);
+  bytes[0] = 0x49; bytes[1] = 0x44; bytes[2] = 0x33; // 'ID3'
+  bytes[20] = 0xff; bytes[21] = 0xe0; // MPEG frame sync
+  bytes[2000] = 0x52; bytes[2001] = 0x49; bytes[2002] = 0x46; bytes[2003] = 0x46; // 'RIFF'
+  assert.equal(containsRiffWavBlock(bytes), true);
+});
+
+test('containsRiffWavBlock passes a clean MP3 payload', () => {
+  const bytes = new Uint8Array(2100);
+  bytes[20] = 0xff; bytes[21] = 0xe0;
+  assert.equal(containsRiffWavBlock(bytes), false);
+});
+
+test('containsRiffWavBlock handles tiny and empty payloads', () => {
+  assert.equal(containsRiffWavBlock(new Uint8Array(0)), false);
+  assert.equal(containsRiffWavBlock(new Uint8Array([0x52, 0x49, 0x46])), false);
+  assert.equal(containsRiffWavBlock(new Uint8Array([0x52, 0x49, 0x46, 0x46])), true);
+});
+
+// ---------- first-chunk leak guard (isMp3Head) ----------
+
+test('isMp3Head accepts an ID3v2 head', () => {
+  // First status:1 chunk of a fresh generation starts with the ID3 tag.
+  assert.equal(isMp3Head('4944330400000000'), true);
+  assert.equal(isMp3Head('494433'), true);
+});
+
+test('isMp3Head accepts MPEG frame sync heads', () => {
+  // Continuation chunks start with 0xFFFx sync words.
+  assert.equal(isMp3Head('fffb9064'), true);
+  assert.equal(isMp3Head('ffe39064'), true);
+  assert.equal(isMp3Head('FFF39000'), true); // uppercase tolerated
+});
+
+test('isMp3Head rejects a leaked WAV tail and garbage', () => {
+  // A tail of a foreign/aborted stream would start with RIFF.
+  assert.equal(isMp3Head('52494646'), false);
+  assert.equal(isMp3Head('00fffb90'), false);
+  assert.equal(isMp3Head('zzff'), false);
+});
+
+test('isMp3Head rejects empty, short, and non-string input', () => {
+  assert.equal(isMp3Head(''), false);
+  assert.equal(isMp3Head('ff'), false);
+  assert.equal(isMp3Head(null), false);
+  assert.equal(isMp3Head(undefined), false);
+  assert.equal(isMp3Head(42), false);
 });
 
 // ---------- buildAudioDataUrl ----------

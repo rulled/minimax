@@ -7,7 +7,14 @@
 // via chrome.scripting.executeScript({ func }). MAIN-world functions cannot
 // require() this module, so background.js keeps an inline copy. When you change
 // logic here, update the inline copy in background.js (search for the markers
-// // SYNC:hexDecode and // SYNC:buildFrame) and re-run tests.
+// // SYNC:hexDecode, // SYNC:streamFilter, // SYNC:riffScan, // SYNC:mp3Head and
+// // SYNC:buildFrame) and re-run tests.
+//
+// Stream protocol (verified against a live WS capture, 03.09.2026):
+// the server streams the MP3 incrementally in frames with data.status === 1,
+// and the final frame (data.status === 2) carries a FULL WAV of the same take
+// plus subtitles. Consumers must only append status:1 audio chunks; the
+// status:2 audio is the WAV mixdown and must never be glued onto the MP3.
 
 /**
  * Build the T2aAsync frame submitted over the WebSocket.
@@ -161,6 +168,38 @@ function findMpegFrameOffset(bytes) {
 }
 
 /**
+ * Head check: does a hex chunk start like an MP3 (ID3v2 tag or MPEG frame
+ * sync)? Used for the first-chunk leak guard (a fresh generation's first
+ * status:1 chunk must have an MP3 head — anything else means the site's
+ * shared WS manager delivered a tail of a foreign stream) and for the
+ * final-frame MP3 fallback.
+ *
+ * @param {string} hex
+ * @returns {boolean}
+ */
+function isMp3Head(hex) {
+  return typeof hex === 'string' && /^(494433|ff[ef])/i.test(hex.slice(0, 6));
+}
+
+/**
+ * Detect an embedded RIFF/WAV block anywhere in the payload. The MiniMax WS
+ * stream glues a full WAV mixdown onto the MP3 when status frames are not
+ * filtered, which corrupts the file for strict demuxers.
+ *
+ * @param {Uint8Array} bytes
+ * @returns {boolean}
+ */
+function containsRiffWavBlock(bytes) {
+  if (!bytes || bytes.length < 4) return false;
+  for (let i = 0; i + 3 < bytes.length; i += 1) {
+    if (bytes[i] === 0x52 && bytes[i + 1] === 0x49 && bytes[i + 2] === 0x46 && bytes[i + 3] === 0x46) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Validate that the decoded bytes look like a real MP3:
  * - at least 1024 bytes
  * - an MPEG frame sync (0xFFEx) at the computed offset
@@ -200,6 +239,8 @@ module.exports = {
   computeStateSignature,
   decodeHexAudio,
   findMpegFrameOffset,
+  containsRiffWavBlock,
+  isMp3Head,
   isValidMp3,
   buildAudioDataUrl,
   HEX_NIBBLE
