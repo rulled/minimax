@@ -111,9 +111,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   const counterValue = document.getElementById('counterValue');
   const resetButton = document.getElementById('resetButton');
   const directTtsStatus = document.getElementById('directTtsStatus');
-  const submissionRecoveryArea = document.getElementById('submissionRecoveryArea');
-  const submissionRecoveryStatus = document.getElementById('submissionRecoveryStatus');
-  const resolveSubmissionRecoveryButton = document.getElementById('resolveSubmissionRecoveryButton');
   const voiceCleanupQuota = document.getElementById('voiceCleanupQuota');
   const voiceCleanupCapacityFill = document.getElementById('voiceCleanupCapacityFill');
   const voiceCleanupDeleteButton = document.getElementById('voiceCleanupDeleteButton');
@@ -247,7 +244,6 @@ document.addEventListener('DOMContentLoaded', async () => {
           directTtsStatus.textContent = modeLabel;
       }
   }
-  await refreshSubmissionRecoveryStatus();
   if (parallelModeStatus && parallelModeEnabled) {
       parallelModeStatus.textContent = 'При запуске откроется вторая вкладка MiniMax.';
   }
@@ -263,39 +259,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (!voiceCleanupStatus) return;
       voiceCleanupStatus.textContent = message || '';
       voiceCleanupStatus.className = `voice-source-status${type ? ` ${type}` : ''}`;
-  }
-
-  async function refreshSubmissionRecoveryStatus() {
-      if (!submissionRecoveryArea || !submissionRecoveryStatus) return;
-      const response = await chrome.runtime.sendMessage({ action: 'getSubmissionRecoveryStatus' }).catch(() => null);
-      const summary = response?.summary;
-      const hasRecovery = response?.success && (
-          summary.total > 0 || summary.legacyRecoveryRequired || summary.parallelRecoveryRequired
-      );
-      submissionRecoveryArea.style.display = hasRecovery ? 'block' : 'none';
-      if (!hasRecovery) return;
-      submissionRecoveryStatus.textContent = `Требуется сверка History: regular ${summary.regular}, Long Text ${summary.longText}.`;
-  }
-
-  if (resolveSubmissionRecoveryButton) {
-      resolveSubmissionRecoveryButton.addEventListener('click', async () => {
-          const confirmed = confirm(
-              'Подтвердите, что вы проверили MiniMax History. Ненайденные задачи будут сняты с блокировки без автоматического повтора.'
-          );
-          if (!confirmed) return;
-          const tabs = await chrome.tabs.query({ url: 'https://www.minimax.io/audio/text-to-speech*' });
-          const response = await chrome.runtime.sendMessage({
-              action: 'resolveSubmissionRecovery',
-              confirmed: true,
-              tabId: tabs[0]?.id || null
-          }).catch((error) => ({ success: false, reason: error.message }));
-          if (!response?.success) {
-              showStatus(`Не удалось снять блокировку: ${response?.reason || 'unknown error'}`, 'error');
-              return;
-          }
-          showStatus('Блокировка снята без повторной генерации', 'success');
-          await refreshSubmissionRecoveryStatus();
-      });
   }
 
   function getProtectedVoiceNames() {
@@ -2485,7 +2448,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       else if (msg.action === 'parallelBatchFallback') {
           refreshParallelProgress();
-          showStatus(`2 потока отключены: ${msg.reason}. Осталось: ${msg.remaining}`, 'info');
+          const paidNote = msg.unresolvedPaid > 0
+              ? ` Оплаченных, но не скачанных реплик: ${msg.unresolvedPaid} — проверьте History на сайте.`
+              : '';
+          showStatus(`2 потока отключены: ${msg.reason}. Осталось: ${msg.remaining}.${paidNote}`, 'info');
       }
       else if (msg.action === 'parallelBatchComplete') {
           hideParallelProgress();

@@ -1482,19 +1482,40 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     }
                     var status = Number(message?.data?.status);
                     if (!message?.data || (status !== 1 && status !== 2)) return;
-                    if (typeof message.data.audio === 'string' && message.data.audio) {
+                    // SYNC:streamFilter — the server streams the MP3 incrementally in
+                    // status:1 frames; the final status:2 frame carries a FULL WAV of the
+                    // same take (plus subtitles). Appending it glues a WAV blob onto the
+                    // MP3 and corrupts the file, so only status:1 chunks feed the MP3
+                    // buffer. Verified against a live WS capture (03.09.2026).
+                    if (status === 1 && typeof message.data.audio === 'string' && message.data.audio) {
+                      // SYNC:mp3Head — mirrors isMp3Head() in direct_transport.js.
+                      // Leak guard: the first status:1 chunk of a fresh generation
+                      // always starts with an MP3 head (ID3 tag or frame sync).
+                      // Anything else means the site's shared WS manager delivered
+                      // a tail of a foreign/aborted stream — fail fast instead of
+                      // gluing it into the file.
+                      if (audioHexChunks.length === 0
+                        && !/^(494433|ff[ef])/i.test(message.data.audio.slice(0, 6))) {
+                        finish({ ok: false, disposition: 'accepted_unknown', reason: 'minimax_direct_stream_misaligned', msgId: msgId, responseMeta: responseMeta });
+                        return;
+                      }
                       audioHexChunks.push(message.data.audio);
                     }
                     if (status !== 2) return;
                     var audioHex = audioHexChunks.join('');
+                    if (!audioHex && typeof message.data.audio === 'string'
+                      && /^(494433|ff[ef])/i.test(message.data.audio.slice(0, 6))) {
+                      // No incremental MP3 arrived; the final frame itself is an MP3.
+                      audioHex = message.data.audio;
+                    }
                     // SYNC:hexDecode — mirrors decodeHexAudio in direct_transport.js.
                     // Update both and re-run tests/direct_transport.test.js if this changes.
                     if (!audioHex || audioHex.length % 2 !== 0) {
                       finish({ ok: false, disposition: 'accepted_unknown', reason: 'minimax_direct_audio_invalid', msgId: msgId, responseMeta: responseMeta });
                       return;
                     }
-                    var hexTable = new Uint8Array(128);
-                    for (var t = 0; t < 128; t += 1) hexTable[t] = 255;
+                    var hexTable = new Uint8Array(256);
+                    for (var t = 0; t < 256; t += 1) hexTable[t] = 255;
                     '0123456789abcdefABCDEF'.split('').forEach(function(ch, idx) {
                       hexTable[ch.charCodeAt(0)] = idx < 16 ? idx : idx - 6;
                     });
@@ -1511,6 +1532,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                       finish({ ok: false, disposition: 'accepted_unknown', reason: 'minimax_direct_audio_invalid', msgId: msgId, responseMeta: responseMeta });
                       return;
                     }
+                    // SYNC:riffScan — mirrors containsRiffWavBlock in direct_transport.js:
+                    // a RIFF head anywhere in the payload means a WAV stream leaked into
+                    // the MP3 buffer (corrupt glued file) — reject instead of saving.
+                    var hasEmbeddedWav = false;
+                    for (var scan = 0; scan + 3 < bytes.length; scan += 1) {
+                      if (bytes[scan] === 0x52 && bytes[scan + 1] === 0x49 && bytes[scan + 2] === 0x46 && bytes[scan + 3] === 0x46) {
+                        hasEmbeddedWav = true;
+                        break;
+                      }
+                    }
                     var audioOffset = 0;
                     if (bytes.length >= 10 && bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) {
                       var id3Size = ((bytes[6] & 0x7f) << 21)
@@ -1522,7 +1553,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     var hasMpegFrame = audioOffset + 1 < bytes.length
                       && bytes[audioOffset] === 0xff
                       && (bytes[audioOffset + 1] & 0xe0) === 0xe0;
-                    if (bytes.length < 1024 || !hasMpegFrame) {
+                    if (bytes.length < 1024 || !hasMpegFrame || hasEmbeddedWav) {
                       finish({ ok: false, disposition: 'accepted_unknown', reason: 'minimax_direct_mp3_invalid', msgId: msgId, responseMeta: responseMeta });
                       return;
                     }
@@ -1936,7 +1967,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               });
               candidates = candidates.filter(function(item) {
                 if (task.audioId || !task.submittedAt) return true;
-                return normUpdateTime(item.update_time) >= Number(task.submittedAt);
+                // submittedAt is the local Date.now() at submit; update_time is
+                // server-side. Allow 120s of clock skew so a server timestamp
+                // marginally before the local one doesn't drop the real match.
+                return normUpdateTime(item.update_time) >= Number(task.submittedAt) - 120000;
               });
               if (!task.audioId && candidates.length > 1) {
                 var topDelta = Math.abs(normUpdateTime(candidates[0].update_time) - Number(task.submittedAt || 0));
@@ -2400,6 +2434,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 const MINIMAX_TTS_URL = 'https://www.minimax.io/audio/text-to-speech';
 const LONG_TEXT_ALARM = 'longTextHistoryPoll';
+// Ready-task download retries before surfacing reconciliation_required.
+// The audio URL can expire server-side; without a cap the poll loop retried
+// silently every minute for up to 24 hours. ~30 min of retries is enough.
+const LONG_TEXT_DOWNLOAD_RETRY_LIMIT = 30;
 
 function getDefaultLongTextState() {
   return {
@@ -2442,22 +2480,10 @@ function getLongTextSummary() {
     failed: count(['error', 'reconciliation_required']),
     isSubmitting: longTextState.isSubmitting === true,
     hasPollable: count(['queued', 'submitting', 'awaiting_match', 'pending', 'ready', 'downloading']) > 0,
-    hasActive: count(['queued', 'submitting', 'awaiting_match', 'pending', 'ready', 'downloading', 'reconciliation_required']) > 0
-  };
-}
-
-async function getSubmissionRecoverySummary() {
-  const [regularSubmissions] = await Promise.all([
-    getUnresolvedRegularSubmissions(),
-    loadLongTextState()
-  ]);
-  const unresolvedLongText = longTextState.tasks.filter((task) => (
-    ['queued', 'submitting', 'awaiting_match', 'pending', 'reconciliation_required'].includes(task.status)
-  ));
-  return {
-    regular: regularSubmissions.length,
-    longText: unresolvedLongText.length,
-    total: regularSubmissions.length + unresolvedLongText.length
+    // Only genuinely in-flight submission phases may block new runs. Stuck
+    // 'ready'/'reconciliation_required' tasks retry on their own and must
+    // never paralyze the extension (user decision 04.09.2026).
+    hasActive: count(['queued', 'submitting', 'awaiting_match', 'pending']) > 0
   };
 }
 
@@ -2481,100 +2507,6 @@ async function confirmAutomationStopped(tabId, matchesRuntime) {
   }
   if (runtime.state?.isRunning) throw new Error('another_automation_runtime_active');
   return true;
-}
-
-async function resolveSubmissionRecovery(tabId) {
-  await Promise.all([loadBatchState(), loadParallelBatchState(), loadLongTextState()]);
-  if (longTextState.isSubmitting
-    || (batchState.isRunning && !batchState.activeJob)
-    || (parallelBatchState.isRunning && !parallelBatchState.runId)) {
-    throw new Error('automation_running');
-  }
-  if (batchState.activeJob && batchState.activeTabId) {
-    await confirmAutomationStopped(batchState.activeTabId, (runtime) => (
-      runtime.legacyJobId === batchState.activeJob.legacyJobId
-    ));
-  }
-  if (parallelBatchState.runId) {
-    for (const worker of parallelBatchState.workers || []) {
-      await confirmAutomationStopped(worker.tabId, (runtime) => (
-        runtime.runId === parallelBatchState.runId && runtime.workerId === worker.workerId
-      ));
-    }
-  }
-
-  batchState.isRunning = false;
-  parallelBatchState.isRunning = false;
-  await Promise.all([saveBatchState(), saveParallelBatchState()]);
-
-  const recoverySummary = await getSubmissionRecoverySummary();
-  if (recoverySummary.total > 0 && !tabId) {
-    throw new Error('minimax_tab_required_for_history_reconciliation');
-  }
-  if (recoverySummary.total > 0) {
-    await chrome.tabs.get(tabId);
-    await reconcileRegularSubmissionLedger(tabId);
-    const unresolvedLongText = longTextState.tasks.filter((task) => (
-      ['queued', 'submitting', 'awaiting_match', 'pending', 'reconciliation_required'].includes(task.status)
-    ));
-    const claimedAudioIds = longTextState.tasks.map((task) => task.audioId).filter(Boolean);
-    const historyResponse = await sendTabMessageWithTimeout(tabId, {
-      action: 'queryLongTextHistory',
-      timeout: 30000,
-      tasks: unresolvedLongText.map((task) => ({
-        localId: task.localId,
-        audioId: task.audioId,
-        text: task.text,
-        voiceId: task.voiceId,
-        voiceName: task.selectedVoiceName,
-        submittedAt: task.submittedAt,
-        excludedAudioIds: [...(longTextState.baselineAudioIds || []), ...claimedAudioIds]
-      }))
-    }, 30000);
-    if (!historyResponse?.success) {
-      throw new Error(historyResponse?.reason || 'long_text_history_reconciliation_failed');
-    }
-    for (const match of historyResponse.matches || []) {
-      const task = longTextState.tasks.find((item) => item.localId === match.localId);
-      if (task && match.record) applyLongTextHistoryRecord(task, match.record);
-    }
-    await saveLongTextState();
-  }
-
-  const regularSubmissions = await getUnresolvedRegularSubmissions();
-  await chrome.storage.local.set({ [REGULAR_SUBMISSION_LEDGER_KEY]: [] });
-
-  let abandonedLongText = 0;
-  for (const task of longTextState.tasks) {
-    if (!['queued', 'submitting', 'awaiting_match', 'pending', 'reconciliation_required'].includes(task.status)) continue;
-    task.status = 'error';
-    task.submissionPhase = 'manually_abandoned';
-    task.error = 'Manually cleared after History review; automatic retry is disabled';
-    abandonedLongText += 1;
-  }
-  await saveLongTextState();
-  await stopLongTextAlarmIfIdle();
-  broadcastLongTextProgress();
-
-  if (batchState.recoveryRequired) {
-    batchState.activeJob = null;
-    batchState.recoveryRequired = false;
-    batchState.error = null;
-    batchState.isRunning = false;
-    await saveBatchState();
-  }
-  if (!parallelBatchState.isRunning && parallelBatchState.runId) {
-    const secondaryTabId = parallelBatchState.secondaryTabId;
-    parallelBatchState = __pb_getDefaultState();
-    await saveParallelBatchState();
-    await closeTabSafely(secondaryTabId);
-  }
-
-  return {
-    success: true,
-    clearedRegular: regularSubmissions.length,
-    clearedLongText: abandonedLongText
-  };
 }
 
 function broadcastLongTextProgress() {
@@ -3043,6 +2975,18 @@ async function pollLongTextTasks() {
     modifiedTasks.set(task.localId, { ...task });
   }
   for (const task of longTextState.tasks.filter((item) => item.status === 'ready')) {
+    task.downloadAttempts = Number(task.downloadAttempts || 0) + 1;
+    if (task.downloadAttempts > LONG_TEXT_DOWNLOAD_RETRY_LIMIT) {
+      task.status = 'reconciliation_required';
+      task.error = `Long Text download failed ${task.downloadAttempts - 1} times (audio URL kept expiring or download was rejected); manual reconciliation is required`;
+      DiagLog.warn('longText', 'Long Text download retries exhausted', {
+        localId: task.localId,
+        downloadAttempts: task.downloadAttempts - 1,
+        lastError: task.error
+      });
+      modifiedTasks.set(task.localId, { ...task });
+      continue;
+    }
     try {
       await downloadReadyLongTextTask(task);
     } catch (error) {
@@ -3318,22 +3262,14 @@ async function fallbackParallelBatch(reason) {
   }));
   await stopPrimaryWorkerForFallback(primaryTabId, parallelBatchState.runId);
 
-  const unresolvedPaidEntries = (parallelBatchState.workers || []).flatMap((worker) => (
+  // Paid-but-unconfirmed entries are kept out of the retry by
+  // buildRemainingParallelJobs (isEntryProtected), never re-sent. We no longer
+  // freeze the whole batch for them: the freeze was part of the removed
+  // manual-reconciliation flow and left a ghost two-stream UI behind
+  // (user decision 04.09.2026 — never lock, just report).
+  const unresolvedPaidCount = (parallelBatchState.workers || []).flatMap((worker) => (
     (worker.queue || []).filter((entry) => entry.paidSubmissionStarted && !entry.downloadConfirmed)
-  ));
-  if (unresolvedPaidEntries.length > 0) {
-    parallelBatchState.isRunning = false;
-    parallelBatchState.isFallingBack = false;
-    parallelBatchState.error = 'Paid submissions require History reconciliation before retry';
-    await saveParallelBatchState();
-    await chrome.alarms.clear('parallelBatchWatchdog');
-    await closeTabSafely(secondaryTabId);
-    chrome.runtime.sendMessage({
-      action: 'automationError',
-      error: 'Параллельный пакет остановлен: отправленные задачи требуют сверки с History перед повтором.'
-    }).catch(() => {});
-    return;
-  }
+  )).length;
 
   const remainingJobs = buildRemainingParallelJobs();
   parallelBatchState = __pb_getDefaultState();
@@ -3354,7 +3290,8 @@ async function fallbackParallelBatch(reason) {
   chrome.runtime.sendMessage({
     action: 'parallelBatchFallback',
     reason,
-    remaining: remainingJobs.reduce((sum, job) => sum + job.queue.length, 0)
+    remaining: remainingJobs.reduce((sum, job) => sum + job.queue.length, 0),
+    unresolvedPaid: unresolvedPaidCount
   }).catch(() => {});
 }
 
@@ -3568,8 +3505,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     const now = Date.now();
     for (const worker of parallelBatchState.workers) {
       if (worker.status === 'complete') continue;
-      if (!parallelBatchState.isPaused && now - Number(worker.lastProgressAt || parallelBatchState.startedAt || now) > 360000) {
-        await fallbackParallelBatch('Поток не сообщил о прогрессе более 360 секунд');
+      // 480s: generation budget can now reach 300s (content_script timeout
+      // formula), so the old 360s floor left too little headroom for the
+      // worker to report progress between long generations.
+      if (!parallelBatchState.isPaused && now - Number(worker.lastProgressAt || parallelBatchState.startedAt || now) > 480000) {
+        await fallbackParallelBatch('Поток не сообщил о прогрессе более 480 секунд');
         return;
       }
       try {
@@ -3665,9 +3605,12 @@ async function saveBatchState() {
 async function startLegacyBatchProcessing(jobs, tabId) {
   return queueLegacyBatchOperation(async () => {
     await loadBatchState();
-    if (batchState.activeJob || batchState.recoveryRequired) {
-      return { success: false, reason: 'legacy_batch_reconciliation_required' };
+    if (batchState.isRunning) {
+      return { success: false, reason: 'automation_already_running' };
     }
+    // A stale interrupted state (activeJob/recoveryRequired from a crashed
+    // run) is discarded here, never used to block: user decision 04.09.2026 —
+    // an unrecoverable lock is worse than a rare duplicate generation.
     batchState = {
       queue: Array.isArray(jobs) ? jobs : [],
       activeTabId: tabId,
@@ -3722,15 +3665,13 @@ async function startLongTextAwareBatch(jobs, tabId, useParallel) {
     tabId
   });
   assertLongTextLimits(jobs);
-  if (batchState.activeJob || batchState.recoveryRequired) {
-    return { success: false, reason: 'legacy_batch_reconciliation_required' };
-  }
-  if (parallelBatchState.runId) {
-    return { success: false, reason: 'parallel_batch_reconciliation_required' };
-  }
-  const unresolvedRegularSubmissions = await reconcileRegularSubmissionLedger(tabId);
-  if (unresolvedRegularSubmissions.length > 0) {
-    return { success: false, reason: 'regular_submission_reconciliation_required' };
+  // Best-effort History sweep: download audio that already exists for past
+  // paid submissions. Never blocks or fails the start (user decision
+  // 04.09.2026: an unrecoverable lock is worse than a rare double payment).
+  try {
+    await reconcileRegularSubmissionLedger(tabId);
+  } catch (error) {
+    DiagLog.warn('batch', 'History reconciliation skipped before start', { reason: error?.message || 'unknown' });
   }
   if (batchState.isRunning || parallelBatchState.isRunning || getLongTextSummary().hasActive) {
     return { success: false, reason: 'automation_already_running' };
@@ -3805,29 +3746,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       await loadParallelBatchState();
       return getParallelBatchDisplayState();
     }).then((state) => sendResponse({ success: true, state }))
-      .catch((error) => sendResponse({ success: false, reason: error.message }));
-    return true;
-  }
-
-  if (request.action === 'getSubmissionRecoveryStatus') {
-    Promise.all([loadBatchState(), loadParallelBatchState()])
-      .then(() => getSubmissionRecoverySummary())
-      .then((summary) => sendResponse({ success: true, summary: {
-        ...summary,
-        legacyRecoveryRequired: batchState.recoveryRequired === true,
-        parallelRecoveryRequired: !parallelBatchState.isRunning && !!parallelBatchState.runId
-      } }))
-      .catch((error) => sendResponse({ success: false, reason: error.message }));
-    return true;
-  }
-
-  if (request.action === 'resolveSubmissionRecovery') {
-    if (request.confirmed !== true) {
-      sendResponse({ success: false, reason: 'confirmation_required' });
-      return true;
-    }
-    queueParallelOperation(() => resolveSubmissionRecovery(request.tabId || null))
-      .then(sendResponse)
       .catch((error) => sendResponse({ success: false, reason: error.message }));
     return true;
   }
