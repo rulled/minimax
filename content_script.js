@@ -1348,11 +1348,21 @@ class VoiceoverAutomation {
                 await this.rollbackUndispatchedSubmission(entry, submissionId);
                 throw error;
             }
+            // Scale bridge timeout with text length. generateDirectAudio
+            // dispatches via WebSocket and the server streams audio chunks
+            // back; for long entries (>= 2000 chars) the round-trip can easily
+            // exceed 15s. Background's own timer is 180s — we just need to
+            // give the bridge call enough time to wait for it.
+            // The trailing number is the bridge timeout in ms; callDirectBridge
+            // strips it before forwarding args to the MAIN world function,
+            // which receives (text, signature, voiceId, requestedTimeout).
+            const generationTimeout = Math.max(20000, Math.ceil(String(entry.text).length / 50) * 1000);
             directResult = await this.callDirectBridge(
                 'generateDirectAudio',
                 entry.text,
                 readyState.signature || '',
-                entry.voiceId || ''
+                entry.voiceId || '',
+                generationTimeout
             );
             await chrome.storage.local.set({
                 directTtsLastResult: {
@@ -1514,6 +1524,14 @@ class VoiceoverAutomation {
     }
 
     async callDirectBridge(action, ...args) {
+        // Last positional arg, if it's a number, is the bridge timeout in ms.
+        // Lets the caller scale the wait for long-running transports like
+        // generateDirectAudio on long text.
+        let timeoutMs = 15000;
+        if (args.length > 0 && typeof args[args.length - 1] === 'number') {
+            timeoutMs = Math.max(1000, args[args.length - 1]);
+            args = args.slice(0, -1);
+        }
         try {
             const response = await Promise.race([
                 chrome.runtime.sendMessage({
@@ -1521,7 +1539,7 @@ class VoiceoverAutomation {
                     method: action,
                     args
                 }),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('bridge_timeout')), 15000))
+                new Promise((_, reject) => setTimeout(() => reject(new Error('bridge_timeout')), timeoutMs))
             ]);
             if (!response?.success) {
                 return { ok: false, disposition: 'accepted_unknown', reason: response?.reason || 'direct_bridge_response_failed' };
