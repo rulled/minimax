@@ -2335,6 +2335,50 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         } catch (e) {
           sendResponse({ success: false, reason: e.message });
         }
+      } else if (request.action === 'releaseDirectAudio') {
+        // Fire-and-forget cleanup: close any in-flight direct WebSocket on the
+        // page so the server-side 180s watchdog can reclaim bandwidth. The
+        // singleton wsKey 'tts' is shared by generateDirectAudio and
+        // submitDirectLongText; only one direct call is in flight per tab at
+        // any time, so a single close() covers the current call.
+        if (!extensionEnabled) {
+          sendResponse({ success: false, reason: 'disabled' });
+          return;
+        }
+        const releaseTabId = request.tabId || sender.tab?.id;
+        if (!releaseTabId) {
+          sendResponse({ success: false, reason: 'no tab id' });
+          return;
+        }
+        try {
+          const results = await chrome.scripting.executeScript({
+            target: { tabId: releaseTabId },
+            world: 'MAIN',
+            // SYNC:mirror — keep in lockstep with the inline manager lookup in
+            // generateDirectAudio / submitDirectLongText in background.js.
+            func: () => {
+              try {
+                const req = window.__mmWebpackRequire;
+                if (!req?.m) return { ok: false, reason: 'minimax_api_runtime_missing' };
+                const managerModuleId = req.m['78544'] ? '78544' : Object.keys(req.m).find((id) =>
+                  String(req.m[id]).indexOf('/v1/api/audio/ws') >= 0
+                );
+                const managerModule = managerModuleId ? req(managerModuleId) : null;
+                const manager = managerModule && Object.values(managerModule).find((value) =>
+                  value && typeof value.close === 'function'
+                );
+                if (!manager) return { ok: false, reason: 'minimax_manager_not_found' };
+                manager.close('tts');
+                return { ok: true, wsKey: 'tts' };
+              } catch (e) {
+                return { ok: false, reason: e?.message || 'release_failed' };
+              }
+            }
+          });
+          sendResponse({ success: true, result: results[0]?.result });
+        } catch (e) {
+          sendResponse({ success: false, reason: e.message });
+        }
       }
     } catch (error) {
       console.error('Error:', error);

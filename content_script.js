@@ -1348,15 +1348,14 @@ class VoiceoverAutomation {
                 await this.rollbackUndispatchedSubmission(entry, submissionId);
                 throw error;
             }
-            // Scale bridge timeout with text length. generateDirectAudio
-            // dispatches via WebSocket and the server streams audio chunks
-            // back; for long entries (>= 2000 chars) the round-trip can easily
-            // exceed 15s. Background's own timer is 180s — we just need to
-            // give the bridge call enough time to wait for it.
+            // Floor at 60s: a 25MB audio stream on a loaded server can take
+            // 30-90s even for short text after a heavy entry. Cap at 150s to
+            // stay under the background's 180s server-side watchdog ceiling.
             // The trailing number is the bridge timeout in ms; callDirectBridge
             // strips it before forwarding args to the MAIN world function,
             // which receives (text, signature, voiceId, requestedTimeout).
-            const generationTimeout = Math.max(20000, Math.ceil(String(entry.text).length / 50) * 1000);
+            const textLen = String(entry.text || '').length;
+            const generationTimeout = Math.max(60000, Math.min(150000, Math.ceil(textLen / 50) * 1000));
             directResult = await this.callDirectBridge(
                 'generateDirectAudio',
                 entry.text,
@@ -1547,6 +1546,15 @@ class VoiceoverAutomation {
             return response.result || { ok: false, disposition: 'accepted_unknown', reason: 'direct_bridge_empty_result' };
         } catch (error) {
             if (error?.message === 'bridge_timeout') {
+                // Signal the MAIN world to close any in-flight WS so the
+                // server-side 180s watchdog can reclaim bandwidth instead of
+                // streaming 25MB chunks into the void. Fire-and-forget:
+                // there's no point waiting — we already gave up on the
+                // response. The in-flight generateDirectAudio will still
+                // resolve (with minimax_direct_socket_closed) but its result
+                // is harmlessly discarded.
+                chrome.runtime.sendMessage({ action: 'releaseDirectAudio' })
+                    .catch(() => {});
                 return { ok: false, disposition: 'bridge_timeout', reason: 'bridge_timeout' };
             }
             return { ok: false, disposition: 'accepted_unknown', reason: error?.message || 'direct_bridge_response_failed' };

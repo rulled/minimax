@@ -106,5 +106,33 @@ async function test(name, fn) {
     assert.equal(result.reason, 'bridge_timeout');
   });
 
-  console.log('ℹ tests 5');
+  // ---- generationTimeout formula: max(60000, min(150000, len/50 * 1000)) ----
+  // Mirrors the formula in content_script.js processEntry.
+
+  function generationTimeout(textLen) {
+    return Math.max(60000, Math.min(150000, Math.ceil(textLen / 50) * 1000));
+  }
+
+  await test('generationTimeout floor at 60s for very short text', async () => {
+    assert.equal(generationTimeout(0), 60000);
+    assert.equal(generationTimeout(50), 60000);
+    assert.equal(generationTimeout(100), 60000);
+    assert.equal(generationTimeout(800), 60000);
+  });
+
+  await test('generationTimeout floor wins until 3000 chars', async () => {
+    // 3000/50 = 60s, equal to floor.
+    assert.equal(generationTimeout(1500), 60000);  // 30s, floor wins
+    assert.equal(generationTimeout(2500), 60000);  // 50s, floor wins
+    assert.equal(generationTimeout(2999), 60000);
+  });
+
+  await test('generationTimeout scales with length above 3000 chars', async () => {
+    assert.equal(generationTimeout(5000), 100000);
+    assert.equal(generationTimeout(7500), 150000);  // 150s = cap
+    assert.equal(generationTimeout(10000), 150000); // cap
+    assert.equal(generationTimeout(25000), 150000); // cap
+  });
+
+  console.log('ℹ tests 8');
 })();
