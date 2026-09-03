@@ -1261,32 +1261,26 @@ class VoiceoverAutomation {
         // === ГЛАВНОЕ: Вставка текста (Замена всего старого на новое) ===
         await this.insertText(targetEl, entry.text);
 
-        this.log('Waiting for React to validate input...');
-        await this.sleep(1000); 
-
+        // Wait for the direct TTS state to stabilize (text/voice/language/settings).
+        // Replaces the legacy UI button probe + history capture which were UI-based
+        // and caused bridge_timeout now that direct transport bypasses the React UI.
+        const readyTimeout = Math.max(10000, Math.ceil(String(entry.text).length / 1000) * 1500);
+        const readyState = await this.waitForDirectTtsReady(
+            entry.text,
+            entry.voiceId || '',
+            entry.language || '',
+            readyTimeout
+        );
+        this.throwIfLongTextCancelled();
         if (!this.isRunning) {
-            this.log('STOP requested, aborting before generate');
+            this.log('STOP requested, aborting before dispatch');
             return;
         }
 
-        // Дожидаемся, пока кнопка генерации реально готова к следующему запуску.
-        let generateBtn = await this.waitForGenerateButtonReady();
-        if (!generateBtn) {
-            throw new Error('Generate button not active');
-        }
-
-        const historyInstallResult = await this.callBridge('ensureLongTextHistoryCapture');
-        if (!historyInstallResult?.ok) {
-            throw new Error(`History capture install failed: ${historyInstallResult?.reason || 'unknown reason'}`);
-        }
-        const historyResetResult = await this.callBridge('resetLongTextHistoryCapture');
-        if (!historyResetResult?.ok) {
-            throw new Error(`History capture reset failed: ${historyResetResult?.reason || 'unknown reason'}`);
-        }
-
         const submittedAt = Date.now();
-        const baselineHistory = await this.queryLongTextHistory([], 30000);
-        const baselineAudioIds = Array.isArray(baselineHistory.audioIds) ? baselineHistory.audioIds : [];
+        // baselineAudioIds no longer needed for direct transport — the bridge
+        // returns audio inline. Reconciliation against history_list is only
+        // triggered on the accepted_unknown fallback path (see generateDirectAudio).
         await this.waitForDispatchAllowed();
         let submissionId = crypto.randomUUID();
         entry.paidSubmissionStarted = true;
@@ -1303,7 +1297,6 @@ class VoiceoverAutomation {
             voiceId: entry.voiceId || '',
             voiceName: entry.voiceName || '',
             transport: 'direct',
-            baselineAudioIds,
             speakerName: entry.speaker || entry.originalTag || '',
             scriptName: entry.scriptName || this.scriptName || null,
             downloadIndex: entry.downloadIndex || entry.speakerIndex || null,
@@ -1358,7 +1351,7 @@ class VoiceoverAutomation {
             directResult = await this.callDirectBridge(
                 'generateDirectAudio',
                 entry.text,
-                '',
+                readyState.signature || '',
                 entry.voiceId || ''
             );
             await chrome.storage.local.set({
