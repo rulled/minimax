@@ -1,0 +1,16 @@
+.DS_Store
+Thumbs.db
+
+.idea/
+.vscode/
+.chrome-debug-profile/
+
+dist/
+release/
+artifacts/
+
+node_modules/
+
+*.log
+*.tmp
+*.zip
