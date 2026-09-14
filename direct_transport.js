@@ -7,7 +7,7 @@
 // via chrome.scripting.executeScript({ func }). MAIN-world functions cannot
 // require() this module, so background.js keeps an inline copy. When you change
 // logic here, update the inline copy in background.js (search for the markers
-// // SYNC:hexDecode, // SYNC:streamFilter, // SYNC:riffScan, // SYNC:mp3Head and
+// // SYNC:hexDecode, // SYNC:streamFilter, // SYNC:riffScan, // SYNC:isMp3Head and
 // // SYNC:buildFrame) and re-run tests.
 //
 // Stream protocol (verified against a live WS capture, 03.09.2026):

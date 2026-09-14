@@ -1488,7 +1488,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     // MP3 and corrupts the file, so only status:1 chunks feed the MP3
                     // buffer. Verified against a live WS capture (03.09.2026).
                     if (status === 1 && typeof message.data.audio === 'string' && message.data.audio) {
-                      // SYNC:mp3Head — mirrors isMp3Head() in direct_transport.js.
+                      // SYNC:isMp3Head — mirrors isMp3Head() in direct_transport.js.
                       // Leak guard: the first status:1 chunk of a fresh generation
                       // always starts with an MP3 head (ID3 tag or frame sync).
                       // Anything else means the site's shared WS manager delivered
@@ -2420,6 +2420,432 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         } catch (e) {
           sendResponse({ success: false, reason: e.message });
         }
+      } else if (request.action === 'getParallelBatchStatus') {
+        queueParallelOperation(async () => {
+          await loadParallelBatchState();
+          return getParallelBatchDisplayState();
+        }).then((state) => sendResponse({ success: true, state }))
+          .catch((error) => sendResponse({ success: false, reason: error.message }));
+      } else if (request.action === 'getLongTextStatus') {
+        queueParallelOperation(async () => {
+          await loadLongTextState();
+          return getLongTextSummary();
+        }).then((summary) => {
+          sendResponse({ success: true, summary });
+        }).catch((error) => sendResponse({ success: false, reason: error.message }));
+      } else if (request.action === "getBatchStatus") {
+        queueLegacyBatchOperation(async () => {
+          await Promise.all([loadBatchState(), loadParallelBatchState()]);
+          if (parallelBatchState.isRunning) {
+            return {
+              success: true,
+              isRunning: true,
+              isParallel: true,
+              state: parallelBatchState,
+              runtime: { ...getParallelProgress(), mode: 'multi' }
+            };
+          }
+          if (!batchState.isRunning || !batchState.activeTabId) {
+            return { success: true, isRunning: false, state: batchState };
+          }
+
+          let runtimeResponse = null;
+          try {
+            runtimeResponse = await sendTabMessageWithTimeout(
+              batchState.activeTabId,
+              { action: 'getAutomationRuntimeState' },
+              7000
+            );
+          } catch (error) {}
+          if (runtimeResponse?.success
+            && runtimeResponse.state?.isRunning
+            && runtimeResponse.state?.legacyJobId === batchState.activeJob?.legacyJobId) {
+            return { success: true, isRunning: true, state: batchState, runtime: runtimeResponse.state };
+          }
+
+          batchState.isRunning = false;
+          batchState.recoveryRequired = !!batchState.activeJob;
+          batchState.error = batchState.activeJob
+            ? 'Active file was interrupted; automatic retry is blocked to prevent duplicate generation'
+            : null;
+          await saveBatchState();
+          await ensureAutomationStateLoaded();
+          await saveAutomationState({
+            progress: { ...(automationState.progress || {}), isRunning: false, isPaused: false }
+          });
+          return { success: true, isRunning: false, state: batchState };
+        }).then(sendResponse).catch((error) => {
+          console.error('[Background] getBatchStatus error:', error);
+          sendResponse({ success: false, reason: error.message });
+        });
+      } else if (request.action === "startBatchProcessing") {
+        // 1. Команда от POPUP: Начать обработку списка файлов
+        masterOperationQueue = masterOperationQueue.then(() =>
+          extensionEnabledReady.then(() => {
+            if (!extensionEnabled) return { success: false, reason: 'disabled' };
+            console.log(`[Background] Получен пакет задач: ${request.jobs.length} файлов`);
+            return queueParallelOperation(async () => {
+              longTextStopRequested = false;
+              return startLongTextAwareBatch(request.jobs, request.tabId, false);
+            });
+          })
+        ).then(sendResponse).catch((error) => sendResponse({ success: false, reason: error.message }));
+      } else if (request.action === "startParallelBatchProcessing") {
+        masterOperationQueue = masterOperationQueue.then(() =>
+          extensionEnabledReady.then(() => {
+            if (!extensionEnabled) return { success: false, reason: 'disabled' };
+            return queueParallelOperation(() => {
+              longTextStopRequested = false;
+              return startLongTextAwareBatch(request.jobs, request.tabId, true);
+            });
+          })
+        ).then(sendResponse).catch((error) => sendResponse({ success: false, reason: error.message }));
+      } else if (request.action === 'automationProgress' && request.runId) {
+        queueParallelOperation(() => updateParallelWorker(request, sender, false)).catch((error) => {
+          console.error('[Background] Parallel progress failed:', error);
+        });
+      } else if (request.action === 'automationProgress' && !request.runId) {
+        queueLegacyBatchOperation(async () => {
+          await loadBatchState();
+          if (!batchState.activeJob) return;
+          if (sender.tab?.id !== batchState.activeTabId) return;
+          if (request.legacyJobId !== batchState.activeJob.legacyJobId) return;
+          batchState.activeJob.queue = Array.isArray(request.queue) ? request.queue : batchState.activeJob.queue;
+          batchState.activeJob.currentIndex = Number(request.currentIndex || 0);
+          batchState.activeJob.lastProgressAt = Date.now();
+          batchState.activeJob.phase = 'running';
+          await saveBatchState();
+        }).catch((error) => console.error('[Background] Legacy progress persistence failed:', error));
+      } else if (request.action === 'reservePaidSubmission' && request.runId) {
+        queueParallelOperation(async () => {
+          await loadParallelBatchState();
+          if (!parallelBatchState.isRunning || parallelBatchState.runId !== request.runId) {
+            throw new Error('parallel_run_not_active');
+          }
+          const worker = parallelBatchState.workers.find((item) => item.workerId === request.workerId);
+          if (worker?.tabId !== sender.tab?.id) throw new Error('parallel_worker_owner_mismatch');
+          const entry = worker?.queue?.find((item) => item._parallelKey === request.parallelKey);
+          if (!entry) throw new Error('parallel_entry_not_found');
+          entry.paidSubmissionStarted = true;
+          entry.submittedAt = Number(request.submittedAt || Date.now());
+          await saveParallelBatchState();
+          return { success: true };
+        }).then(sendResponse).catch((error) => {
+          sendResponse({ success: false, reason: error.message });
+        });
+      } else if (request.action === 'reserveRegularSubmission') {
+        const submissionId = String(request.submissionId || '');
+        const ownerTabId = sender.tab?.id;
+        if (!submissionId || !ownerTabId) {
+          sendResponse({ success: false, reason: !submissionId ? 'submission_id_missing' : 'submission_owner_missing' });
+          return;
+        }
+        queueRegularSubmissionLedger(() => saveRegularSubmission({
+          submissionId,
+          submittedAt: Number(request.submittedAt || Date.now()),
+          runId: request.runId || null,
+          workerId: request.workerId || null,
+          parallelKey: request.parallelKey || null,
+          text: String(request.text || ''),
+          voiceId: String(request.voiceId || ''),
+          voiceName: String(request.voiceName || ''),
+          transport: String(request.transport || 'unknown'),
+          phase: 'reserved',
+          baselineAudioIds: Array.isArray(request.baselineAudioIds) ? request.baselineAudioIds.map(String) : [],
+          speakerName: String(request.speakerName || ''),
+          scriptName: request.scriptName || null,
+          downloadIndex: Number(request.downloadIndex || 0),
+          downloadLayout: request.downloadLayout || null,
+          sourceFileName: request.sourceFileName || null,
+          sourceFileBaseName: request.sourceFileBaseName || null,
+          ownerTabId,
+          completedAt: null
+        })).then(() => sendResponse({ success: true })).catch((error) => {
+          sendResponse({ success: false, reason: error.message });
+        });
+      } else if (request.action === 'markRegularSubmissionSent') {
+        const submissionId = String(request.submissionId || '');
+        queueRegularSubmissionLedger(async () => {
+          const unresolved = await getUnresolvedRegularSubmissions();
+          const entry = unresolved.find((item) => item.submissionId === submissionId);
+          if (!entry) throw new Error('regular_submission_not_found');
+          if (entry.ownerTabId !== sender.tab?.id) throw new Error('regular_submission_owner_mismatch');
+          entry.phase = 'sent';
+          entry.sentAt = Number(request.sentAt || Date.now());
+          await saveRegularSubmission(entry);
+        }).then(() => sendResponse({ success: true })).catch((error) => {
+          sendResponse({ success: false, reason: error.message });
+        });
+      } else if (request.action === 'completeRegularSubmission') {
+        queueRegularSubmissionLedger(async () => {
+          const submissionId = String(request.submissionId || '');
+          const unresolved = await getUnresolvedRegularSubmissions();
+          const entry = unresolved.find((item) => item.submissionId === submissionId);
+          if (!entry) return;
+          if (entry.ownerTabId !== sender.tab?.id) throw new Error('regular_submission_owner_mismatch');
+          await completeRegularSubmission(submissionId);
+        })
+          .then(() => sendResponse({ success: true }))
+          .catch((error) => sendResponse({ success: false, reason: error.message }));
+      } else if (request.action === 'releasePaidSubmission' && request.runId) {
+        queueParallelOperation(async () => {
+          await loadParallelBatchState();
+          if (parallelBatchState.runId !== request.runId) {
+            throw new Error('parallel_run_not_active');
+          }
+          const worker = parallelBatchState.workers.find((item) => item.workerId === request.workerId);
+          if (worker?.tabId !== sender.tab?.id) throw new Error('parallel_worker_owner_mismatch');
+          const entry = worker?.queue?.find((item) => item._parallelKey === request.parallelKey);
+          if (!entry) throw new Error('parallel_entry_not_found');
+          entry.paidSubmissionStarted = false;
+          entry.submittedAt = 0;
+          const hasUnresolvedPaid = parallelBatchState.workers.some((item) => (
+            (item.queue || []).some((queuedEntry) => queuedEntry.paidSubmissionStarted && !queuedEntry.downloadConfirmed)
+          ));
+          if (!parallelBatchState.isRunning && !hasUnresolvedPaid) {
+            parallelBatchState = __pb_getDefaultState();
+          }
+          await saveParallelBatchState();
+          return { success: true };
+        }).then(sendResponse).catch((error) => {
+          sendResponse({ success: false, reason: error.message });
+        });
+      } else if (request.action === 'reserveLongTextSubmission') {
+        queueLongTextSubmission(async () => {
+          if (longTextState.monitorTabId !== sender.tab?.id) throw new Error('long_text_submission_owner_mismatch');
+          const task = longTextState.tasks.find((item) => item.localId === request.localId);
+          if (!task || task.status !== 'submitting') throw new Error('long_text_task_not_submitting');
+          task.submissionPhase = 'reserved';
+          task.reservedAt = Number(request.reservedAt || Date.now());
+          task.transport = String(request.transport || 'unknown');
+          await saveLongTextState();
+          return { success: true };
+        }).then(sendResponse).catch((error) => {
+          sendResponse({ success: false, reason: error.message });
+        });
+      } else if (request.action === 'markLongTextDispatched') {
+        queueLongTextSubmission(async () => {
+          if (longTextState.monitorTabId !== sender.tab?.id) throw new Error('long_text_submission_owner_mismatch');
+          const task = longTextState.tasks.find((item) => item.localId === request.localId);
+          if (!task || task.status !== 'submitting' || task.submissionPhase !== 'reserved') {
+            throw new Error('long_text_task_not_reserved');
+          }
+          task.submissionPhase = 'dispatched';
+          task.dispatchedAt = Number(request.dispatchedAt || Date.now());
+          task.submissionStartedAt = task.dispatchedAt;
+          task.submittedAt = task.dispatchedAt;
+          await saveLongTextState();
+          return { success: true };
+        }).then(sendResponse).catch((error) => {
+          sendResponse({ success: false, reason: error.message });
+        });
+      } else if (request.action === 'releaseLongTextReservation') {
+        queueLongTextSubmission(async () => {
+          if (longTextState.monitorTabId !== sender.tab?.id) throw new Error('long_text_submission_owner_mismatch');
+          const task = longTextState.tasks.find((item) => item.localId === request.localId);
+          if (!task) throw new Error('long_text_task_not_found');
+          task.submissionPhase = null;
+          task.reservedAt = null;
+          task.dispatchedAt = null;
+          task.submissionStartedAt = null;
+          task.submittedAt = null;
+          await saveLongTextState();
+          return { success: true };
+        }).then(sendResponse).catch((error) => {
+          sendResponse({ success: false, reason: error.message });
+        });
+      } else if (request.action === 'markLongTextRejected') {
+        queueLongTextSubmission(async () => {
+          if (longTextState.monitorTabId !== sender.tab?.id) throw new Error('long_text_submission_owner_mismatch');
+          const task = longTextState.tasks.find((item) => item.localId === request.localId);
+          if (!task) throw new Error('long_text_task_not_found');
+          task.submissionStartedAt = null;
+          task.submittedAt = null;
+          task.transport = 'direct_rejected';
+          task.submissionPhase = 'rejected';
+          task.reservedAt = null;
+          task.dispatchedAt = null;
+          task.error = String(request.reason || 'direct_long_text_rejected');
+          await saveLongTextState();
+          return { success: true };
+        }).then(sendResponse).catch((error) => {
+          sendResponse({ success: false, reason: error.message });
+        });
+      } else if (request.action === "automationComplete") {
+        // 2. Сигнал от CONTENT SCRIPT: Текущий файл завершен
+        if (request.runId) {
+          queueParallelOperation(() => updateParallelWorker(request, sender, true)).catch((error) => {
+            console.error('[Background] Parallel completion failed:', error);
+          });
+          return;
+        }
+        // Сначала обновляем состояние из storage (воркер мог спать)
+        queueLegacyBatchOperation(async () => {
+          await loadBatchState();
+          if (!batchState.activeJob) return;
+          if (sender.tab?.id !== batchState.activeTabId) return;
+          if (request.legacyJobId !== batchState.activeJob.legacyJobId) return;
+          if (request.success !== true) {
+            batchState.isRunning = false;
+            batchState.recoveryRequired = request.unresolved === true;
+            batchState.error = request.error || 'Active file failed';
+            if (request.unresolved === true) {
+              batchState.activeJob.phase = 'unresolved';
+            } else {
+              batchState.activeJob = null;
+              batchState.activeTabId = null;
+            }
+            await saveBatchState();
+            return;
+          }
+          batchState.activeJob = null;
+          batchState.recoveryRequired = false;
+          batchState.error = null;
+          batchState.isRunning = batchState.queue.length > 0;
+          if (!batchState.isRunning) batchState.activeTabId = null;
+          await saveBatchState();
+          if (batchState.isRunning && batchState.queue.length > 0) {
+            console.log(`[Background] Файл завершен. Осталось файлов: ${batchState.queue.length}`);
+            setTimeout(() => {
+              queueLegacyBatchOperation(() => processNextBatchItemLocked()).catch((error) => {
+                console.error('[Background] Legacy next item failed:', error);
+              });
+            }, 3000);
+            chrome.alarms.create('legacyBatchWatchdog', { delayInMinutes: 0.5 });
+          }
+        }).catch((error) => console.error('[Background] Legacy completion failed:', error));
+      } else if (request.action === 'pauseBatchProcessing' || request.action === 'resumeBatchProcessing') {
+        queueParallelOperation(async () => {
+          await Promise.all([loadBatchState(), loadParallelBatchState()]);
+          const action = request.action === 'pauseBatchProcessing' ? 'pauseAutomation' : 'resumeAutomation';
+          const tabIds = parallelBatchState.isRunning
+            ? parallelBatchState.workers.map((worker) => worker.tabId)
+            : [batchState.activeTabId].filter(Boolean);
+          if (tabIds.length === 0) throw new Error('automation_worker_missing');
+          const acknowledgements = await Promise.allSettled(
+            tabIds.map((tabId) => sendTabMessageWithTimeout(tabId, { action }, 7000))
+          );
+          const failedAcknowledgement = acknowledgements.find((result) => (
+            result.status !== 'fulfilled' || result.value?.success !== true
+          ));
+          if (failedAcknowledgement) {
+            const reason = failedAcknowledgement.status === 'rejected'
+              ? failedAcknowledgement.reason?.message
+              : failedAcknowledgement.value?.reason;
+            throw new Error(reason || `${action}_not_acknowledged`);
+          }
+          if (parallelBatchState.isRunning) {
+            parallelBatchState.isPaused = action === 'pauseAutomation';
+            await saveParallelBatchState();
+            await broadcastParallelProgress();
+          }
+          sendResponse({ success: true, isPaused: action === 'pauseAutomation' });
+        }).catch((error) => sendResponse({ success: false, reason: error.message }));
+      } else if (request.action === "stopAutomation") {
+        // 3. Команда остановки
+        longTextStopRequested = true;
+        if (longTextState.monitorTabId) {
+          chrome.tabs.sendMessage(longTextState.monitorTabId, { action: 'cancelLongTextSubmissions' }).catch(() => {});
+        }
+        queueParallelOperation(async () => {
+          await Promise.all([loadBatchState(), loadParallelBatchState()]);
+          if (parallelBatchState.isRunning) {
+            const tabIds = parallelBatchState.workers.map((worker) => worker.tabId);
+            const secondaryTabId = parallelBatchState.secondaryTabId;
+            await Promise.allSettled(tabIds.map((tabId) => sendTabMessageWithTimeout(tabId, { action: 'stopAutomation' }, 7000)));
+            await loadParallelBatchState();
+            const unconfirmedWorkers = [];
+            for (const worker of parallelBatchState.workers || []) {
+              try {
+                await confirmAutomationStopped(worker.tabId, (runtime) => (
+                  runtime.runId === parallelBatchState.runId && runtime.workerId === worker.workerId
+                ));
+              } catch (error) {
+                unconfirmedWorkers.push(worker.workerId);
+              }
+            }
+            if (unconfirmedWorkers.length > 0) {
+              parallelBatchState.isRunning = false;
+              parallelBatchState.isPaused = false;
+              parallelBatchState.error = `Stop is unconfirmed for workers: ${unconfirmedWorkers.join(', ')}`;
+              await saveParallelBatchState();
+              sendResponse({
+                success: false,
+                stopped: false,
+                recoveryRequired: true,
+                reason: parallelBatchState.error
+              });
+              return;
+            }
+            const hasUnresolvedPaid = (parallelBatchState.workers || []).some((worker) => (
+              (worker.queue || []).some((entry) => entry.paidSubmissionStarted && !entry.downloadConfirmed)
+            ));
+            if (hasUnresolvedPaid) {
+              parallelBatchState.isRunning = false;
+              parallelBatchState.isPaused = false;
+              parallelBatchState.error = 'Stopped with paid submissions awaiting History reconciliation';
+            } else {
+              parallelBatchState = __pb_getDefaultState();
+            }
+            await saveParallelBatchState();
+            await chrome.alarms.clear('parallelBatchWatchdog');
+            await closeTabSafely(secondaryTabId);
+            await saveAutomationState({
+              progress: { currentIndex: 0, total: 0, completedIds: [], isRunning: false, isPaused: false, workerCount: 0 },
+              mode: 'multi'
+            });
+            sendResponse({ success: true, stopped: true, reconciliationRequired: hasUnresolvedPaid });
+            return;
+          }
+          return queueLegacyBatchOperation(async () => {
+            await loadBatchState();
+            const activeTabId = batchState.activeTabId;
+            let deliveryError = null;
+
+            if (activeTabId) {
+              try {
+                await chrome.tabs.sendMessage(activeTabId, { action: 'stopAutomation' });
+              } catch (error) {
+                deliveryError = error;
+              }
+            }
+
+            batchState.isRunning = false;
+            if (deliveryError && batchState.activeJob) {
+              batchState.recoveryRequired = true;
+              batchState.error = `Stop delivery failed; active file requires reconciliation: ${deliveryError.message}`;
+            } else {
+              batchState.queue = [];
+              batchState.activeTabId = null;
+              batchState.activeJob = null;
+              batchState.recoveryRequired = false;
+              batchState.error = null;
+            }
+            await saveBatchState();
+
+            await ensureAutomationStateLoaded();
+            await saveAutomationState({
+              progress: {
+                ...(automationState.progress || {}),
+                isRunning: false,
+                isPaused: false
+              }
+            });
+
+            if (deliveryError) {
+              sendResponse({
+                success: false,
+                stopped: false,
+                recoveryRequired: !!batchState.activeJob,
+                reason: deliveryError.message
+              });
+              return;
+            }
+            sendResponse({ success: true, stopped: true });
+          });
+        }).catch((error) => {
+          sendResponse({ success: false, reason: error.message });
+        });
       }
     } catch (error) {
       console.error('Error:', error);
@@ -2472,6 +2898,7 @@ async function saveLongTextState() {
   });
   const finishedTasks = longTextState.tasks.filter((task) => !activeTasks.includes(task)).slice(-100);
   longTextState.tasks = [...finishedTasks, ...activeTasks];
+  longTextState.baselineAudioIds = (longTextState.baselineAudioIds || []).slice(-500);
   await chrome.storage.local.set({ longTextState });
 }
 
@@ -3037,6 +3464,11 @@ async function loadParallelBatchState() {
 async function initializeParallelBatchState() {
   await loadParallelBatchState();
   if (parallelBatchState.phase !== 'preparing') return;
+  if (parallelBatchState.phase === 'running' && parallelBatchState.isFallingBack) {
+    parallelBatchState = __pb_getDefaultState();
+    await saveParallelBatchState();
+    return;
+  }
   const secondaryTabId = parallelBatchState.secondaryTabId;
   parallelBatchState.isRunning = false;
   parallelBatchState.isPaused = false;
@@ -3575,6 +4007,7 @@ let batchState = {
   error: null
 };
 let legacyBatchOperationQueue = Promise.resolve();
+let masterOperationQueue = Promise.resolve();
 
 function queueLegacyBatchOperation(operation) {
   const result = legacyBatchOperationQueue.then(operation);
@@ -3746,489 +4179,6 @@ queueLongTextSubmission(() => initializeLongTextState()).catch((error) => {
   console.error('[Background] Long Text state initialization failed:', error);
 });
 
-// Слушаем команды от POPUP и CONTENT SCRIPT
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.action === 'getParallelBatchStatus') {
-    queueParallelOperation(async () => {
-      await loadParallelBatchState();
-      return getParallelBatchDisplayState();
-    }).then((state) => sendResponse({ success: true, state }))
-      .catch((error) => sendResponse({ success: false, reason: error.message }));
-    return true;
-  }
-
-  if (request.action === 'getLongTextStatus') {
-    queueParallelOperation(async () => {
-      await loadLongTextState();
-      return getLongTextSummary();
-    }).then((summary) => {
-      sendResponse({ success: true, summary });
-    }).catch((error) => sendResponse({ success: false, reason: error.message }));
-    return true;
-  }
-
-  if (request.action === "getBatchStatus") {
-    queueLegacyBatchOperation(async () => {
-      await Promise.all([loadBatchState(), loadParallelBatchState()]);
-      if (parallelBatchState.isRunning) {
-        return {
-          success: true,
-          isRunning: true,
-          isParallel: true,
-          state: parallelBatchState,
-          runtime: { ...getParallelProgress(), mode: 'multi' }
-        };
-      }
-      if (!batchState.isRunning || !batchState.activeTabId) {
-        return { success: true, isRunning: false, state: batchState };
-      }
-
-      let runtimeResponse = null;
-      try {
-        runtimeResponse = await sendTabMessageWithTimeout(
-          batchState.activeTabId,
-          { action: 'getAutomationRuntimeState' },
-          7000
-        );
-      } catch (error) {}
-      if (runtimeResponse?.success
-        && runtimeResponse.state?.isRunning
-        && runtimeResponse.state?.legacyJobId === batchState.activeJob?.legacyJobId) {
-        return { success: true, isRunning: true, state: batchState, runtime: runtimeResponse.state };
-      }
-
-      batchState.isRunning = false;
-      batchState.recoveryRequired = !!batchState.activeJob;
-      batchState.error = batchState.activeJob
-        ? 'Active file was interrupted; automatic retry is blocked to prevent duplicate generation'
-        : null;
-      await saveBatchState();
-      await ensureAutomationStateLoaded();
-      await saveAutomationState({
-        progress: { ...(automationState.progress || {}), isRunning: false, isPaused: false }
-      });
-      return { success: true, isRunning: false, state: batchState };
-    }).then(sendResponse).catch((error) => {
-      console.error('[Background] getBatchStatus error:', error);
-      sendResponse({ success: false, reason: error.message });
-    });
-    return true;
-  }
-
-  
-  // 1. Команда от POPUP: Начать обработку списка файлов
-  if (request.action === "startBatchProcessing") {
-    extensionEnabledReady.then(() => {
-      if (!extensionEnabled) return { success: false, reason: 'disabled' };
-      console.log(`[Background] Получен пакет задач: ${request.jobs.length} файлов`);
-      return queueParallelOperation(async () => {
-        longTextStopRequested = false;
-        return startLongTextAwareBatch(request.jobs, request.tabId, false);
-      });
-    }).then(sendResponse).catch((error) => sendResponse({ success: false, reason: error.message }));
-    return true;
-  }
-
-  if (request.action === "startParallelBatchProcessing") {
-    extensionEnabledReady.then(() => {
-      if (!extensionEnabled) return { success: false, reason: 'disabled' };
-      return queueParallelOperation(() => {
-        longTextStopRequested = false;
-        return startLongTextAwareBatch(request.jobs, request.tabId, true);
-      });
-    }).then(sendResponse)
-      .catch((error) => sendResponse({ success: false, reason: error.message }));
-    return true;
-  }
-
-  if (request.action === 'automationProgress' && request.runId) {
-    queueParallelOperation(() => updateParallelWorker(request, sender, false)).catch((error) => {
-      console.error('[Background] Parallel progress failed:', error);
-    });
-    return;
-  }
-
-  if (request.action === 'automationProgress' && !request.runId) {
-    queueLegacyBatchOperation(async () => {
-      await loadBatchState();
-      if (!batchState.activeJob) return;
-      if (sender.tab?.id !== batchState.activeTabId) return;
-      if (request.legacyJobId !== batchState.activeJob.legacyJobId) return;
-      batchState.activeJob.queue = Array.isArray(request.queue) ? request.queue : batchState.activeJob.queue;
-      batchState.activeJob.currentIndex = Number(request.currentIndex || 0);
-      batchState.activeJob.lastProgressAt = Date.now();
-      batchState.activeJob.phase = 'running';
-      await saveBatchState();
-    }).catch((error) => console.error('[Background] Legacy progress persistence failed:', error));
-    return;
-  }
-
-  if (request.action === 'reservePaidSubmission' && request.runId) {
-    queueParallelOperation(async () => {
-      await loadParallelBatchState();
-      if (!parallelBatchState.isRunning || parallelBatchState.runId !== request.runId) {
-        throw new Error('parallel_run_not_active');
-      }
-      const worker = parallelBatchState.workers.find((item) => item.workerId === request.workerId);
-      if (worker?.tabId !== sender.tab?.id) throw new Error('parallel_worker_owner_mismatch');
-      const entry = worker?.queue?.find((item) => item._parallelKey === request.parallelKey);
-      if (!entry) throw new Error('parallel_entry_not_found');
-      entry.paidSubmissionStarted = true;
-      entry.submittedAt = Number(request.submittedAt || Date.now());
-      await saveParallelBatchState();
-      return { success: true };
-    }).then(sendResponse).catch((error) => {
-      sendResponse({ success: false, reason: error.message });
-    });
-    return true;
-  }
-
-  if (request.action === 'reserveRegularSubmission') {
-    const submissionId = String(request.submissionId || '');
-    const ownerTabId = sender.tab?.id;
-    if (!submissionId || !ownerTabId) {
-      sendResponse({ success: false, reason: !submissionId ? 'submission_id_missing' : 'submission_owner_missing' });
-      return;
-    }
-    queueRegularSubmissionLedger(() => saveRegularSubmission({
-      submissionId,
-      submittedAt: Number(request.submittedAt || Date.now()),
-      runId: request.runId || null,
-      workerId: request.workerId || null,
-      parallelKey: request.parallelKey || null,
-      text: String(request.text || ''),
-      voiceId: String(request.voiceId || ''),
-      voiceName: String(request.voiceName || ''),
-      transport: String(request.transport || 'unknown'),
-      phase: 'reserved',
-      baselineAudioIds: Array.isArray(request.baselineAudioIds) ? request.baselineAudioIds.map(String) : [],
-      speakerName: String(request.speakerName || ''),
-      scriptName: request.scriptName || null,
-      downloadIndex: Number(request.downloadIndex || 0),
-      downloadLayout: request.downloadLayout || null,
-      sourceFileName: request.sourceFileName || null,
-      sourceFileBaseName: request.sourceFileBaseName || null,
-      ownerTabId,
-      completedAt: null
-    })).then(() => sendResponse({ success: true })).catch((error) => {
-      sendResponse({ success: false, reason: error.message });
-    });
-    return true;
-  }
-
-  if (request.action === 'markRegularSubmissionSent') {
-    const submissionId = String(request.submissionId || '');
-    queueRegularSubmissionLedger(async () => {
-      const unresolved = await getUnresolvedRegularSubmissions();
-      const entry = unresolved.find((item) => item.submissionId === submissionId);
-      if (!entry) throw new Error('regular_submission_not_found');
-      if (entry.ownerTabId !== sender.tab?.id) throw new Error('regular_submission_owner_mismatch');
-      entry.phase = 'sent';
-      entry.sentAt = Number(request.sentAt || Date.now());
-      await saveRegularSubmission(entry);
-    }).then(() => sendResponse({ success: true })).catch((error) => {
-      sendResponse({ success: false, reason: error.message });
-    });
-    return true;
-  }
-
-  if (request.action === 'completeRegularSubmission') {
-    queueRegularSubmissionLedger(async () => {
-      const submissionId = String(request.submissionId || '');
-      const unresolved = await getUnresolvedRegularSubmissions();
-      const entry = unresolved.find((item) => item.submissionId === submissionId);
-      if (!entry) return;
-      if (entry.ownerTabId !== sender.tab?.id) throw new Error('regular_submission_owner_mismatch');
-      await completeRegularSubmission(submissionId);
-    })
-      .then(() => sendResponse({ success: true }))
-      .catch((error) => sendResponse({ success: false, reason: error.message }));
-    return true;
-  }
-
-  if (request.action === 'releasePaidSubmission' && request.runId) {
-    queueParallelOperation(async () => {
-      await loadParallelBatchState();
-      if (parallelBatchState.runId !== request.runId) {
-        throw new Error('parallel_run_not_active');
-      }
-      const worker = parallelBatchState.workers.find((item) => item.workerId === request.workerId);
-      if (worker?.tabId !== sender.tab?.id) throw new Error('parallel_worker_owner_mismatch');
-      const entry = worker?.queue?.find((item) => item._parallelKey === request.parallelKey);
-      if (!entry) throw new Error('parallel_entry_not_found');
-      entry.paidSubmissionStarted = false;
-      entry.submittedAt = 0;
-      const hasUnresolvedPaid = parallelBatchState.workers.some((item) => (
-        (item.queue || []).some((queuedEntry) => queuedEntry.paidSubmissionStarted && !queuedEntry.downloadConfirmed)
-      ));
-      if (!parallelBatchState.isRunning && !hasUnresolvedPaid) {
-        parallelBatchState = __pb_getDefaultState();
-      }
-      await saveParallelBatchState();
-      return { success: true };
-    }).then(sendResponse).catch((error) => {
-      sendResponse({ success: false, reason: error.message });
-    });
-    return true;
-  }
-
-  if (request.action === 'reserveLongTextSubmission') {
-    queueLongTextSubmission(async () => {
-      if (longTextState.monitorTabId !== sender.tab?.id) throw new Error('long_text_submission_owner_mismatch');
-      const task = longTextState.tasks.find((item) => item.localId === request.localId);
-      if (!task || task.status !== 'submitting') throw new Error('long_text_task_not_submitting');
-      task.submissionPhase = 'reserved';
-      task.reservedAt = Number(request.reservedAt || Date.now());
-      task.transport = String(request.transport || 'unknown');
-      await saveLongTextState();
-      return { success: true };
-    }).then(sendResponse).catch((error) => {
-      sendResponse({ success: false, reason: error.message });
-    });
-    return true;
-  }
-
-  if (request.action === 'markLongTextDispatched') {
-    queueLongTextSubmission(async () => {
-      if (longTextState.monitorTabId !== sender.tab?.id) throw new Error('long_text_submission_owner_mismatch');
-      const task = longTextState.tasks.find((item) => item.localId === request.localId);
-      if (!task || task.status !== 'submitting' || task.submissionPhase !== 'reserved') {
-        throw new Error('long_text_task_not_reserved');
-      }
-      task.submissionPhase = 'dispatched';
-      task.dispatchedAt = Number(request.dispatchedAt || Date.now());
-      task.submissionStartedAt = task.dispatchedAt;
-      task.submittedAt = task.dispatchedAt;
-      await saveLongTextState();
-      return { success: true };
-    }).then(sendResponse).catch((error) => {
-      sendResponse({ success: false, reason: error.message });
-    });
-    return true;
-  }
-
-  if (request.action === 'releaseLongTextReservation') {
-    queueLongTextSubmission(async () => {
-      if (longTextState.monitorTabId !== sender.tab?.id) throw new Error('long_text_submission_owner_mismatch');
-      const task = longTextState.tasks.find((item) => item.localId === request.localId);
-      if (!task) throw new Error('long_text_task_not_found');
-      task.submissionPhase = null;
-      task.reservedAt = null;
-      task.dispatchedAt = null;
-      task.submissionStartedAt = null;
-      task.submittedAt = null;
-      await saveLongTextState();
-      return { success: true };
-    }).then(sendResponse).catch((error) => {
-      sendResponse({ success: false, reason: error.message });
-    });
-    return true;
-  }
-
-  if (request.action === 'markLongTextRejected') {
-    queueLongTextSubmission(async () => {
-      if (longTextState.monitorTabId !== sender.tab?.id) throw new Error('long_text_submission_owner_mismatch');
-      const task = longTextState.tasks.find((item) => item.localId === request.localId);
-      if (!task) throw new Error('long_text_task_not_found');
-      task.submissionStartedAt = null;
-      task.submittedAt = null;
-      task.transport = 'direct_rejected';
-      task.submissionPhase = 'rejected';
-      task.reservedAt = null;
-      task.dispatchedAt = null;
-      task.error = String(request.reason || 'direct_long_text_rejected');
-      await saveLongTextState();
-      return { success: true };
-    }).then(sendResponse).catch((error) => {
-      sendResponse({ success: false, reason: error.message });
-    });
-    return true;
-  }
-
-  // 2. Сигнал от CONTENT SCRIPT: Текущий файл завершен
-  if (request.action === "automationComplete") {
-    if (request.runId) {
-      queueParallelOperation(() => updateParallelWorker(request, sender, true)).catch((error) => {
-        console.error('[Background] Parallel completion failed:', error);
-      });
-      return;
-    }
-    // Сначала обновляем состояние из storage (воркер мог спать)
-    queueLegacyBatchOperation(async () => {
-      await loadBatchState();
-      if (!batchState.activeJob) return;
-      if (sender.tab?.id !== batchState.activeTabId) return;
-      if (request.legacyJobId !== batchState.activeJob.legacyJobId) return;
-      if (request.success !== true) {
-        batchState.isRunning = false;
-        batchState.recoveryRequired = request.unresolved === true;
-        batchState.error = request.error || 'Active file failed';
-        if (request.unresolved === true) {
-          batchState.activeJob.phase = 'unresolved';
-        } else {
-          batchState.activeJob = null;
-          batchState.activeTabId = null;
-        }
-        await saveBatchState();
-        return;
-      }
-      batchState.activeJob = null;
-      batchState.recoveryRequired = false;
-      batchState.error = null;
-      batchState.isRunning = batchState.queue.length > 0;
-      if (!batchState.isRunning) batchState.activeTabId = null;
-      await saveBatchState();
-      if (batchState.isRunning && batchState.queue.length > 0) {
-        console.log(`[Background] Файл завершен. Осталось файлов: ${batchState.queue.length}`);
-        
-        setTimeout(() => {
-          queueLegacyBatchOperation(() => processNextBatchItemLocked()).catch((error) => {
-            console.error('[Background] Legacy next item failed:', error);
-          });
-        }, 3000);
-        chrome.alarms.create('legacyBatchWatchdog', { delayInMinutes: 0.5 });
-      }
-    }).catch((error) => console.error('[Background] Legacy completion failed:', error));
-  }
-
-  if (request.action === 'pauseBatchProcessing' || request.action === 'resumeBatchProcessing') {
-    queueParallelOperation(async () => {
-      await Promise.all([loadBatchState(), loadParallelBatchState()]);
-      const action = request.action === 'pauseBatchProcessing' ? 'pauseAutomation' : 'resumeAutomation';
-      const tabIds = parallelBatchState.isRunning
-        ? parallelBatchState.workers.map((worker) => worker.tabId)
-        : [batchState.activeTabId].filter(Boolean);
-      if (tabIds.length === 0) throw new Error('automation_worker_missing');
-      const acknowledgements = await Promise.allSettled(
-        tabIds.map((tabId) => sendTabMessageWithTimeout(tabId, { action }, 7000))
-      );
-      const failedAcknowledgement = acknowledgements.find((result) => (
-        result.status !== 'fulfilled' || result.value?.success !== true
-      ));
-      if (failedAcknowledgement) {
-        const reason = failedAcknowledgement.status === 'rejected'
-          ? failedAcknowledgement.reason?.message
-          : failedAcknowledgement.value?.reason;
-        throw new Error(reason || `${action}_not_acknowledged`);
-      }
-      if (parallelBatchState.isRunning) {
-        parallelBatchState.isPaused = action === 'pauseAutomation';
-        await saveParallelBatchState();
-        await broadcastParallelProgress();
-      }
-      sendResponse({ success: true, isPaused: action === 'pauseAutomation' });
-    }).catch((error) => sendResponse({ success: false, reason: error.message }));
-    return true;
-  }
-
-  // 3. Команда остановки
-  if (request.action === "stopAutomation") {
-    longTextStopRequested = true;
-    if (longTextState.monitorTabId) {
-      chrome.tabs.sendMessage(longTextState.monitorTabId, { action: 'cancelLongTextSubmissions' }).catch(() => {});
-    }
-    queueParallelOperation(async () => {
-      await Promise.all([loadBatchState(), loadParallelBatchState()]);
-      if (parallelBatchState.isRunning) {
-        const tabIds = parallelBatchState.workers.map((worker) => worker.tabId);
-        const secondaryTabId = parallelBatchState.secondaryTabId;
-        await Promise.allSettled(tabIds.map((tabId) => sendTabMessageWithTimeout(tabId, { action: 'stopAutomation' }, 7000)));
-        await loadParallelBatchState();
-        const unconfirmedWorkers = [];
-        for (const worker of parallelBatchState.workers || []) {
-          try {
-            await confirmAutomationStopped(worker.tabId, (runtime) => (
-              runtime.runId === parallelBatchState.runId && runtime.workerId === worker.workerId
-            ));
-          } catch (error) {
-            unconfirmedWorkers.push(worker.workerId);
-          }
-        }
-        if (unconfirmedWorkers.length > 0) {
-          parallelBatchState.isRunning = false;
-          parallelBatchState.isPaused = false;
-          parallelBatchState.error = `Stop is unconfirmed for workers: ${unconfirmedWorkers.join(', ')}`;
-          await saveParallelBatchState();
-          sendResponse({
-            success: false,
-            stopped: false,
-            recoveryRequired: true,
-            reason: parallelBatchState.error
-          });
-          return;
-        }
-        const hasUnresolvedPaid = (parallelBatchState.workers || []).some((worker) => (
-          (worker.queue || []).some((entry) => entry.paidSubmissionStarted && !entry.downloadConfirmed)
-        ));
-        if (hasUnresolvedPaid) {
-          parallelBatchState.isRunning = false;
-          parallelBatchState.isPaused = false;
-          parallelBatchState.error = 'Stopped with paid submissions awaiting History reconciliation';
-        } else {
-          parallelBatchState = __pb_getDefaultState();
-        }
-        await saveParallelBatchState();
-        await chrome.alarms.clear('parallelBatchWatchdog');
-        await closeTabSafely(secondaryTabId);
-        await saveAutomationState({
-          progress: { currentIndex: 0, total: 0, completedIds: [], isRunning: false, isPaused: false, workerCount: 0 },
-          mode: 'multi'
-        });
-        sendResponse({ success: true, stopped: true, reconciliationRequired: hasUnresolvedPaid });
-        return;
-      }
-      return queueLegacyBatchOperation(async () => {
-        await loadBatchState();
-        const activeTabId = batchState.activeTabId;
-        let deliveryError = null;
-
-        if (activeTabId) {
-          try {
-            await chrome.tabs.sendMessage(activeTabId, { action: 'stopAutomation' });
-          } catch (error) {
-            deliveryError = error;
-          }
-        }
-
-        batchState.isRunning = false;
-        if (deliveryError && batchState.activeJob) {
-          batchState.recoveryRequired = true;
-          batchState.error = `Stop delivery failed; active file requires reconciliation: ${deliveryError.message}`;
-        } else {
-          batchState.queue = [];
-          batchState.activeTabId = null;
-          batchState.activeJob = null;
-          batchState.recoveryRequired = false;
-          batchState.error = null;
-        }
-        await saveBatchState();
-
-        await ensureAutomationStateLoaded();
-        await saveAutomationState({
-          progress: {
-            ...(automationState.progress || {}),
-            isRunning: false,
-            isPaused: false
-          }
-        });
-
-        if (deliveryError) {
-          sendResponse({
-            success: false,
-            stopped: false,
-            recoveryRequired: !!batchState.activeJob,
-            reason: deliveryError.message
-          });
-          return;
-        }
-        sendResponse({ success: true, stopped: true });
-      });
-    }).catch((error) => {
-      sendResponse({ success: false, reason: error.message });
-    });
-    return true;
-  }
-});
 
 // Функция отправки задачи во вкладку
 async function processNextBatchItemLocked() {
