@@ -67,7 +67,28 @@ if (Test-Path $archivePath) {
   Remove-Item $archivePath -Force
 }
 
-Compress-Archive -Path (Join-Path $stagingDir "*") -DestinationPath $archivePath -CompressionLevel Optimal
+# Compress-Archive в Windows PowerShell 5.1 пишет имена записей с обратными
+# слэшами (`icons\16.png`) — это нарушает ZIP-спецификацию, и на macOS/Linux
+# такой архив распаковывается в плоские файлы с `\` в имени. Собираем архив
+# вручную с прямыми слэшами.
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+$archive = [System.IO.Compression.ZipFile]::Open($archivePath, [System.IO.Compression.ZipArchiveMode]::Create)
+try {
+  Get-ChildItem -Path $stagingDir -Recurse -File | Sort-Object FullName | ForEach-Object {
+    $entryName = $_.FullName.Substring($stagingDir.Length + 1).Replace("\", "/")
+    [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+      $archive,
+      $_.FullName,
+      $entryName,
+      [System.IO.Compression.CompressionLevel]::Optimal
+    ) | Out-Null
+  }
+} finally {
+  $archive.Dispose()
+}
+
 Remove-Item $stagingDir -Recurse -Force
 
 Write-Output "Created $archivePath"

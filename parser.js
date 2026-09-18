@@ -1,6 +1,31 @@
 /**
- * Parser для извлечения реплик из markdown-текста
- * Поддерживает как заголовки (**Speaker**:\nText), так и inline-стиль (**Speaker**: Text).
+ * Parser для извлечения реплик из markdown-текста.
+ *
+ * ФОРМУЛА ДЕЛЕНИЯ ТЕКСТА НА БЛОКИ ОЗВУЧКИ
+ * ---------------------------------------
+ * 1 блок = 1 реплика = заголовок спикера + весь текст до следующего заголовка
+ * (пустые строки внутри блока схлопываются, абзацы разделяются `\n`).
+ *
+ * Граница блока — единственный обязательный селектор: markdown-выделение
+ * `**Спикер**` (две `*` с каждой стороны) отдельной строкой. Всё остальное в
+ * заголовке опционально и на границу не влияет:
+ *
+ *   **Диктор**              базовый вариант: без индекса и без двоеточия
+ *   **Диктор:**             двоеточие внутри жирного
+ *   **Диктор**:             двоеточие сразу после жирного
+ *   **Диктор 1**            индекс отделён пробелом
+ *   **Диктор 1:**           индекс + двоеточие
+ *   **ДИКТОР(70739835) 1:** индекс + идентификатор пака (голоса)
+ *   **Диктор**: текст       инлайн-текст в той же строке (двоеточие обязательно)
+ *
+ * Индекс в заголовке — необязательная метка. Он НИКОГДА не участвует в
+ * маппинге голосов (отбрасывается в normalizeSpeakerName, поэтому `**Диктор**`,
+ * `**Диктор 1**` и `**Диктор 7**` — один и тот же спикер) и НИКОГДА не задаёт
+ * порядок: порядок блоков = порядок строк в файле, он же становится
+ * download_index для нарезки озвучки.
+ *
+ * Двоеточие обязательно только тогда, когда в строке после заголовка идёт
+ * текст: так жирный фрагмент внутри абзаца не превращается в нового спикера.
  */
 
 function cleanText(text) {
@@ -54,7 +79,37 @@ function normalizeSpeakerName(rawName) {
   // Работает для "Laura Ingraham 1" -> "Laura Ingraham"
   // Работает для "Sam Altman 5" -> "Sam Altman"
   // Работает для "Dictor 1" -> "Dictor"
+  // Работает для "ДИКТОР(70739835) 1" -> "ДИКТОР(70739835)"
   return name.replace(/\s+\d+$/, '');
+}
+
+// Жирный заголовок целиком: `**Спикер**`, `**Спикер:**`, `**Спикер**:`,
+// `**Спикер**: текст`. `\\?` допускает экранированные звёздочки
+// (`\*\*Спикер\*\*`) в уже сохранённых файлах.
+const SPEAKER_HEADER_RE = /^\\?\*\\?\*(.+?)\\?\*\\?\*\s*(:?)\s*(.*)$/;
+// Заголовок — короткая метка спикера, а не абзац: длинная «жирная» строка
+// спикером не считается и остаётся текстом текущего блока.
+const MAX_SPEAKER_HEADER_LENGTH = 80;
+
+// Строка — граница блока? → { rawSpeaker, inlineText } либо null.
+function matchSpeakerHeader(line) {
+  const match = String(line || '').match(SPEAKER_HEADER_RE);
+  if (!match) return null;
+
+  const colonAfterBold = match[2] === ':';
+  const inlineText = match[3].trim();
+  let rawSpeaker = match[1].trim();
+
+  // `**Диктор:**` — двоеточие попадает внутрь жирного захвата.
+  const colonInsideBold = /:\s*$/.test(rawSpeaker);
+  if (colonInsideBold) rawSpeaker = rawSpeaker.replace(/:\s*$/, '').trim();
+
+  if (!rawSpeaker || rawSpeaker.length > MAX_SPEAKER_HEADER_LENGTH) return null;
+  // Без двоеточия заголовок должен занимать строку целиком, иначе это жирный
+  // фрагмент внутри абзаца.
+  if (!colonAfterBold && !colonInsideBold && inlineText) return null;
+
+  return { rawSpeaker, inlineText };
 }
 
 function parseMarkdown(markdownText) {
@@ -73,8 +128,6 @@ function parseMarkdown(markdownText) {
     sourceTag: '',
     downloadIndex: null
   };
-
-  const headerRegex = /^(?:\\)?\*\*(?:\\)?\*?(.+?)(?:\\)?\*?(?:\\)?(?::\*\*|\*\*\s*:)(.*)$/;
 
   function finalizeCurrentEntry() {
     if (!currentEntry || !currentEntry.text.trim()) return;
@@ -112,14 +165,13 @@ function parseMarkdown(markdownText) {
       continue;
     }
 
-    const headerMatch = line.match(headerRegex);
+    const header = matchSpeakerHeader(line);
 
-    if (headerMatch) {
+    if (header) {
       finalizeCurrentEntry();
 
-      let rawSpeaker = headerMatch[1].trim();
-      let inlineText = headerMatch[2] ? headerMatch[2].trim() : '';
-      let finalSpeaker = normalizeSpeakerName(rawSpeaker);
+      const { rawSpeaker, inlineText } = header;
+      const finalSpeaker = normalizeSpeakerName(rawSpeaker);
 
       currentEntry = {
         id: `${finalSpeaker.replace(/\s+/g, '_')}-${i}`,
