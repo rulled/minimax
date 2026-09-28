@@ -22,6 +22,19 @@ let currentAutomationMode = 'single';
 let skippedEntriesBuffer = [];
 const MAX_ENTRY_ATTEMPTS = 3;
 const AUTOMATION_HEARTBEAT_MS = 45000;
+// Код MiniMax 2600018 — «Your request is too frequent». Приходит ДО списания
+// (disposition='rejected', ledger освобождается), поэтому реплику можно
+// безопасно переотправить. Наблюдение 25.09: паузы ~10 с хватает.
+const RATE_LIMIT_CODE = 2600018;
+const RATE_LIMIT_WAIT_MS = 10000;
+const RATE_LIMIT_MAX_ATTEMPTS = 20;
+
+function isRateLimitRejection(result) {
+    if (!result) return false;
+    if (String(result.category || '') === 'rate_limit') return true;
+    if (Number(result.code) === RATE_LIMIT_CODE) return true;
+    return /too frequent|rate ?limit/i.test(String(result.reason || ''));
+}
 
 async function initialize() {
   try {
@@ -680,14 +693,32 @@ class VoiceoverAutomation {
             // a cold WS; 15s was aborting mixed multi runs.
             const textLen = String(task.text || '').length;
             const submitTimeout = Math.max(60000, Math.min(180000, Math.ceil(textLen / 1000) * 1500 + 30000));
-            const directResult = await this.callDirectBridge(
-                'submitDirectLongText',
-                task.text,
-                readyState.signature,
-                task.voiceId || '',
-                submitTimeout,
-                submitTimeout
-            );
+            let directResult = null;
+            for (let attempt = 1; ; attempt += 1) {
+                directResult = await this.callDirectBridge(
+                    'submitDirectLongText',
+                    task.text,
+                    readyState.signature,
+                    task.voiceId || '',
+                    submitTimeout,
+                    submitTimeout
+                );
+                // Лимит частоты (2600018) — запрос отклонён до списания; текст уже
+                // вставлен в редактор, поэтому безопасно отправить его снова.
+                if (!isRateLimitRejection(directResult)
+                    || attempt > RATE_LIMIT_MAX_ATTEMPTS
+                    || this.longTextCancellationRequested
+                    || this.isStopped) break;
+                this.log(`Long Text rate limited — retry ${attempt}/${RATE_LIMIT_MAX_ATTEMPTS} in ${RATE_LIMIT_WAIT_MS} ms`);
+                DiagLog.warn('longText', 'Лимит частоты MiniMax — повтор после паузы', {
+                    localId: task.localId,
+                    voiceId: task.voiceId || '',
+                    tokenLength: textLen,
+                    rateLimitAttempts: attempt,
+                    waitMs: RATE_LIMIT_WAIT_MS
+                });
+                await this.sleep(RATE_LIMIT_WAIT_MS);
+            }
             await chrome.storage.local.set({
                 directTtsLastResult: {
                     mode: 'long',
@@ -1221,6 +1252,28 @@ class VoiceoverAutomation {
                     error: error.message
                 });
                 entry.attempt = Number(entry.attempt || 0) + 1;
+
+                // Лимит частоты MiniMax (2600018): запрос отклонён до списания,
+                // поэтому просто ждём и переотправляем ту же реплику.
+                if (entry.rateLimited && this.isRunning) {
+                    entry.rateLimited = false;
+                    entry.submissionRejected = false;
+                    entry.rateLimitAttempts = Number(entry.rateLimitAttempts || 0) + 1;
+                    if (entry.rateLimitAttempts <= RATE_LIMIT_MAX_ATTEMPTS) {
+                        this.log(`Rate limited by MiniMax — retry ${entry.rateLimitAttempts}/${RATE_LIMIT_MAX_ATTEMPTS} in ${RATE_LIMIT_WAIT_MS} ms`);
+                        DiagLog.warn('entry', 'Лимит частоты MiniMax — повтор после паузы', {
+                            speaker: entry.speaker,
+                            voiceId: entry.voiceId,
+                            rateLimitAttempts: entry.rateLimitAttempts,
+                            waitMs: RATE_LIMIT_WAIT_MS
+                        });
+                        this.notifyProgress();
+                        await this.sleep(RATE_LIMIT_WAIT_MS);
+                        continue;
+                    }
+                    this.log(`Rate limit persists after ${RATE_LIMIT_MAX_ATTEMPTS} attempts — skipping entry`);
+                }
+
                 if (!entry.paidSubmissionStarted
                     && !entry.submissionRejected
                     && entry.attempt < MAX_ENTRY_ATTEMPTS
@@ -1236,7 +1289,18 @@ class VoiceoverAutomation {
                     : error.message;
                 this.notifyProgress();
                 this.currentIndex++;
-                throw new Error(entry.error);
+                // Фатально останавливаемся только на реально неоднозначной оплате
+                // («возможно, списалось» — нужна сверка с History). Любая другая
+                // ошибка (отказ, лимит, DOM) не должна убивать остаток очереди:
+                // 25.09 одна такая ошибка стоила 28 блоков.
+                if (entry.paidSubmissionStarted && !entry.submissionRejected) {
+                    throw new Error(entry.error);
+                }
+                DiagLog.warn('entry', 'Реплика пропущена — очередь продолжается', {
+                    speaker: entry.speaker,
+                    voiceId: entry.voiceId,
+                    error: entry.error
+                });
             }
         }
     }
@@ -1467,8 +1531,13 @@ class VoiceoverAutomation {
                     }
                     entry.paidSubmissionStarted = false;
                     entry.submissionRejected = true;
+                    // Лимит частоты — не «неоднозначное состояние»: запрос отклонён
+                    // до списания. Помечаем для повтора в processQueue.
+                    if (isRateLimitRejection(directResult)) entry.rateLimited = true;
                 }
-                throw new Error(`Direct generation may have been accepted: ${directResult?.reason || directResult?.disposition || 'unknown'}`);
+                throw new Error(directResult?.disposition === 'rejected'
+                    ? `Direct generation rejected by MiniMax: ${directResult?.reason || directResult?.disposition || 'unknown'}`
+                    : `Direct generation may have been accepted: ${directResult?.reason || directResult?.disposition || 'unknown'}`);
             } else {
                 this.log(`Direct audio completed (${directResult.size || 0} bytes)`);
                 DiagLog.info('direct', 'Генерация готова', {
@@ -1682,6 +1751,15 @@ class VoiceoverAutomation {
             if (!expectedVoiceId || await this.isExpectedVoiceIdActive(expectedVoiceId)) return;
         }
 
+        // 2. Прямая установка голоса экшеном стора MiniMax (tts/selectVoice) —
+        // то же, что делает кнопка Use. С 29.09.2026 (сборка prod-en-0.1.43)
+        // поиск в модалке Voice Selection бьёт только по библиотеке: запрос уходит
+        // с is_system:true независимо от активного таба, поэтому свои голоса
+        // (My Voices) карточкой больше не находятся и вся очередь уходила в
+        // skipped_voice_not_found. Стор-путь от разметки модалки не зависит;
+        // UI-ветка ниже остаётся откатом на случай смены модулей сайта.
+        if (await this.selectVoiceViaStore(targetId, expectedVoiceId)) return;
+
         await this.ensureSettingsPanelOpen();
 
         // 2. Проверяем реальный DOM (в т.ч. блок с copy-иконкой в h4)
@@ -1785,6 +1863,38 @@ class VoiceoverAutomation {
     async isExpectedVoiceIdActive(expectedVoiceId) {
         const state = await this.callBridge('getDirectTtsReadyState', '', expectedVoiceId);
         return String(state?.voiceId || '') === String(expectedVoiceId || '');
+    }
+
+    // Прямая установка голоса через стор MiniMax (bridge.selectVoiceRecord —
+    // экшен tts/selectVoice, тот же, что дёргает кнопка Use). Возвращает true
+    // только если сайт подтвердил voice_id в своём состоянии: иначе вызывающий
+    // код откатывается на старый UI-путь.
+    async selectVoiceViaStore(voiceLabel, expectedVoiceId = '') {
+        try {
+            // Холодный поиск голоса листает My Voices (а библиотеку — только как
+            // последнюю попытку), поэтому дефолтных 15 с моста может не хватить.
+            const result = await this.callBridgeTimed(30000, 'selectVoiceRecord', voiceLabel || '', expectedVoiceId || '');
+            if (!result?.ok) {
+                this.log(`Store voice switch unavailable (${result?.reason || 'bridge_unavailable'}), falling back to UI`);
+                DiagLog.warn('voice', 'Прямая установка голоса не удалась — откат на UI', {
+                    voiceLabel: voiceLabel || '',
+                    voiceId: expectedVoiceId || '',
+                    reason: result?.reason || 'bridge_unavailable'
+                });
+                return false;
+            }
+            this.log(`Voice "${voiceLabel}" set via MiniMax store (voice_id ${result.voiceId}, source ${result.source})`);
+            DiagLog.info('voice', 'Голос установлен через стор MiniMax', {
+                voiceLabel: voiceLabel || '',
+                voiceId: result.voiceId,
+                source: result.source
+            });
+            this.currentVoiceId = voiceLabel;
+            return true;
+        } catch (error) {
+            this.log(`Store voice switch error: ${error.message}`);
+            return false;
+        }
     }
 
     async ensureLanguage(targetLang) {

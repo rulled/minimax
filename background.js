@@ -255,6 +255,18 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
   suggest();
 });
 
+// Категория отказа прямой генерации. Код 2600018 — «Your request is too frequent»:
+// сервер отклонил запрос ДО списания, такую реплику можно безопасно переотправить
+// после паузы (см. RATE_LIMIT_* в content_script.js).
+const RATE_LIMIT_CODES = new Set([2600018]);
+
+function classifyDirectRejection(reason, code) {
+  const text = String(reason || '');
+  if (RATE_LIMIT_CODES.has(Number(code)) || /too frequent|rate ?limit/i.test(text)) return 'rate_limit';
+  if (/credit|balance|quota|insufficient/i.test(text)) return 'insufficient_credit';
+  return 'server_rejected';
+}
+
 // Валидация URL для MP3 файлов
 function isValidAudioUrl(url) {
   try {
@@ -1009,6 +1021,187 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             return { ok: true, voices: voices };
           },
 
+          selectVoiceRecord: async function(voiceName, voiceId) {
+            // Ставит голос напрямую экшеном стора MiniMax (tts/selectVoice) — тем
+            // же, что дёргает кнопка Use в модалке Voice Selection.
+            // Зачем: в сборке prod-en-0.1.43 поле поиска в модалке ищет ТОЛЬКО
+            // библиотеку — запрос уходит с is_system:true независимо от активного
+            // таба, поэтому свои голоса (My Voices) карточкой больше не находятся
+            // и вся очередь уходила в skipped_voice_not_found.
+            var targetName = String(voiceName || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            var targetId = String(voiceId || '').trim();
+            if (!targetName && !targetId) return { ok: false, reason: 'voice_target_missing' };
+            // У публичных голосов в метке стоит uniq_id (moss_audio_...), а не
+            // voice_id/voice_name из API — сопоставить нечем, оставляем UI-ветку.
+            if (targetName.startsWith('moss_audio_') || targetId.startsWith('moss_audio_')) {
+              return { ok: false, reason: 'voice_target_unsupported' };
+            }
+
+            var webpackRequire = window.__mmWebpackRequire || null;
+            if (!webpackRequire) {
+              window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+              window.webpackChunk_N_E.push([['minimax-select-voice-' + Date.now()], {}, function(require) {
+                webpackRequire = require;
+                window.__mmWebpackRequire = require;
+              }]);
+            }
+            if (!webpackRequire?.m) return { ok: false, reason: 'minimax_api_runtime_missing' };
+
+            function moduleIdFor(marker, preferredId) {
+              if (preferredId && webpackRequire.m[preferredId]) return preferredId;
+              return Object.keys(webpackRequire.m).find(function(id) {
+                return String(webpackRequire.m[id]).indexOf(marker) >= 0;
+              }) || '';
+            }
+
+            // RTK-экшены сериализуются в свой type, поэтому создателя ищем по toString().
+            function findActionCreator(moduleExports, actionType) {
+              if (!moduleExports) return null;
+              var direct = Object.values(moduleExports).find(function(value) {
+                return typeof value === 'function' && String(value) === actionType;
+              });
+              if (direct) return direct;
+              var slice = Object.values(moduleExports).find(function(value) {
+                return value && value.actions && typeof value.actions === 'object';
+              });
+              if (!slice) return null;
+              return Object.values(slice.actions).find(function(value) {
+                return typeof value === 'function' && String(value) === actionType;
+              }) || null;
+            }
+
+            var storeModuleId = moduleIdFor('persistor:function', '66021');
+            var store = storeModuleId ? webpackRequire(storeModuleId)?.store : null;
+            if (!store?.getState || !store?.dispatch) return { ok: false, reason: 'minimax_store_missing' };
+
+            var ttsModuleId = moduleIdFor('name:"tts"', '3833');
+            var selectVoice = ttsModuleId ? findActionCreator(webpackRequire(ttsModuleId), 'tts/selectVoice') : null;
+            if (!selectVoice) return { ok: false, reason: 'minimax_select_voice_action_missing' };
+
+            var voiceModuleId = moduleIdFor('name:"voice"', '98719');
+            var resetEffects = voiceModuleId ? findActionCreator(webpackRequire(voiceModuleId), 'voice/resetEffects') : null;
+
+            var voiceApiModuleId = Object.keys(webpackRequire.m).find(function(id) {
+              return String(webpackRequire.m[id]).indexOf('/v1/api/audio/voice/list') >= 0;
+            });
+            if (!voiceApiModuleId) return { ok: false, reason: 'minimax_voice_api_missing' };
+            var voiceApi = webpackRequire(voiceApiModuleId);
+            var listVoices = Object.values(voiceApi).find(function(value) {
+              return typeof value === 'function'
+                && String(value).indexOf('/v1/api/audio/voice/list') >= 0;
+            });
+            if (!listVoices) return { ok: false, reason: 'minimax_voice_api_export_missing' };
+
+            // Список голосов нужен только чтобы достать запись выбранного голоса
+            // (selectVoice кладёт её в selectedVoice и берёт из неё voice_id).
+            // Кэш на минуту: очередь гоняет одни и те же 2-3 голоса подряд.
+            var CACHE_TTL_MS = 60000;
+            var voiceListCache = window.__mmVoiceListCache = window.__mmVoiceListCache || {};
+
+            // Серверный фильтр по имени (filter_type 2) отвечает одной страницей —
+            // так холодный поиск укладывается в один запрос вместо полного
+            // листания. Если источник фильтр игнорирует, страницу добёрет
+            // обычный постраничный проход ниже.
+            async function probeByName(source, name) {
+              try {
+                var payload = await listVoices({
+                  is_system: source.is_system,
+                  is_collect: source.is_collect,
+                  page: 1,
+                  page_size: 30,
+                  filter: [{ filter_type: 2, filter_value_list: [name], filter_relation: 1 }],
+                  user_language: document.documentElement.lang || 'en'
+                });
+                return payload && Array.isArray(payload.voice_list) ? payload.voice_list : [];
+              } catch (error) {
+                return [];
+              }
+            }
+
+            async function loadVoices(source) {
+              var cacheKey = String(source.is_system) + ':' + String(source.is_collect);
+              var cached = voiceListCache[cacheKey];
+              if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return cached.voices;
+              var voices = [];
+              var page = 1;
+              var hasMore = true;
+              while (hasMore && page <= source.maxPages) {
+                var payload = await listVoices({
+                  is_system: source.is_system,
+                  is_collect: source.is_collect,
+                  page: page,
+                  page_size: 30,
+                  filter: [],
+                  user_language: document.documentElement.lang || 'en'
+                });
+                if (!payload || !Array.isArray(payload.voice_list)) return [];
+                voices = voices.concat(payload.voice_list);
+                hasMore = Boolean(payload.has_more);
+                if (!payload.voice_list.length) break;
+                page += 1;
+              }
+              voiceListCache[cacheKey] = { fetchedAt: Date.now(), voices: voices };
+              return voices;
+            }
+
+            function matches(voice) {
+              if (!voice || typeof voice !== 'object') return false;
+              if (targetId) return String(voice.voice_id || '').trim() === targetId;
+              var name = String(voice.voice_name || '').replace(/\s+/g, ' ').trim().toLowerCase();
+              return !!targetName && name === targetName;
+            }
+
+            var sources = [
+              { is_system: false, is_collect: false, label: 'my_voices', maxPages: 40 },
+              { is_system: false, is_collect: true, label: 'collected_voices', maxPages: 40 },
+              // Библиотека — только как последняя попытка: 671 запись и более,
+              // полный проход дорогой, поэтому страниц мало.
+              { is_system: true, is_collect: false, label: 'library', maxPages: 12 }
+            ];
+            var found = null;
+            var foundSource = '';
+            for (var index = 0; index < sources.length && !found; index += 1) {
+              var hit = null;
+              if (targetName) {
+                var probed = [];
+                try {
+                  probed = await probeByName(sources[index], targetName);
+                } catch (error) {
+                  probed = [];
+                }
+                hit = probed.find(matches) || null;
+              }
+              if (!hit) {
+                var voices;
+                try {
+                  voices = await loadVoices(sources[index]);
+                } catch (error) {
+                  voices = [];
+                }
+                hit = voices.find(matches) || null;
+              }
+              if (hit) {
+                found = hit;
+                foundSource = sources[index].label;
+              }
+            }
+            if (!found) return { ok: false, reason: 'voice_not_found_in_account' };
+
+            store.dispatch(selectVoice(found));
+            if (resetEffects) store.dispatch(resetEffects());
+            var appliedVoiceId = String(store.getState()?.tts?.settings?.voice_id || '');
+            var expectedVoiceId = String(found.voice_id || '').trim();
+            if (appliedVoiceId !== expectedVoiceId) {
+              return { ok: false, reason: 'voice_id_not_applied', voiceId: appliedVoiceId, expected: expectedVoiceId };
+            }
+            return {
+              ok: true,
+              voiceId: appliedVoiceId,
+              voiceName: String(found.voice_name || ''),
+              source: foundSource
+            };
+          },
+
           getGenerationCredit: async function(requestedCharacters) {
             var webpackRequire = null;
             window.webpackChunk_N_E = window.webpackChunk_N_E || [];
@@ -1305,9 +1498,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         ok: false,
                         disposition: 'rejected',
                         reason: rejectionReason,
-                        category: /credit|balance|quota|insufficient/i.test(rejectionReason)
-                          ? 'insufficient_credit'
-                          : 'server_rejected',
+                        category: classifyDirectRejection(rejectionReason, code),
                         code: code,
                         msgId: msgId,
                         responseMeta: responseMeta
@@ -1470,10 +1661,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                     var rawCode = message?.statusInfo?.code ?? message?.base_resp?.status_code;
                     var code = rawCode == null ? null : Number(rawCode);
                     if (code !== null && code !== 0) {
+                      var regularRejectionReason = String(message?.statusInfo?.message || message?.base_resp?.status_msg || 'minimax_direct_rejected');
                       finish({
                         ok: false,
                         disposition: 'rejected',
-                        reason: String(message?.statusInfo?.message || message?.base_resp?.status_msg || 'minimax_direct_rejected'),
+                        reason: regularRejectionReason,
+                        category: classifyDirectRejection(regularRejectionReason, code),
                         code: code,
                         msgId: msgId,
                         responseMeta: responseMeta
