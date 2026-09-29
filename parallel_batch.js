@@ -21,6 +21,7 @@ function getDefaultParallelBatchState() {
     runId: null,
     primaryTabId: null,
     secondaryTabId: null,
+    secondaryTabIds: [],
     originalJobs: [],
     workers: [],
     startedAt: null
@@ -28,63 +29,113 @@ function getDefaultParallelBatchState() {
 }
 
 /**
- * Build a two-worker parallel plan from jobs.
+ * Build an N-worker parallel plan from jobs (N = 2, 3, 4).
  *
- * Groups entries by voiceId (a voice is never split across workers), then
- * greedily assigns whole voice-groups to whichever worker has the lower
- * cumulative text-length weight, heaviest-group-first.
- *
- * Rejects when:
- *   - any entry is missing voiceId
- *   - fewer than 2 distinct voiceIds
- *   - the greedy assignment leaves a worker empty (one voice outweighs all
- *     others combined)
+ * Иерархическая 2-уровневая формула балансировки:
+ * 1. Уровень 1 (jobs.length >= workerCount):
+ *    LPT Bin-Packing по ЦЕЛЫМ файлам. Каждый файл/VSL озвучивается целиком
+ *    в одном потоке от начала до конца, без разрыва контекста, прыжков языка
+ *    и перемешивания файлов в папках загрузки.
+ * 2. Уровень 2 (jobs.length < workerCount):
+ *    Если загружен 1 файл или файлов меньше числа потоков:
+ *    а) если уникальных голосов >= workerCount — LPT-раскладка по голосам.
+ *    б) если голосов меньше — деление очереди на N сбалансированных сегментов.
  *
  * @param {Array<{queue: Array<{voiceId:string, text:string, [key:string]:*}>}>} jobs
- * @returns {{ok:boolean, workers?:Array, reason?:string}}
+ * @param {number} [workerCount=2] Желаемое число потоков (2..4)
+ * @returns {{ok:boolean, workers?:Array, strategy?:string, reason?:string}}
  */
-function buildParallelPlan(jobs) {
+function buildParallelPlan(jobs, workerCount = 2) {
+  const targetCount = Math.max(2, Math.min(4, Number(workerCount || 2)));
+  const totalEntries = (jobs || []).reduce((total, job) => total + (job.queue || []).length, 0);
+  if (totalEntries === 0) {
+    return { ok: false, reason: 'Очередь реплик пуста' };
+  }
+
+  // --- УРОВЕНЬ 1: Мульти-файловый режим (файлов >= потоков) ---
+  if ((jobs || []).length >= targetCount) {
+    const sortedJobs = jobs.map((job, idx) => ({
+      idx,
+      job,
+      weight: (job.queue || []).reduce((sum, e) => sum + String(e.text || '').length, 0)
+    })).sort((a, b) => b.weight - a.weight);
+
+    const workers = Array.from({ length: targetCount }, (_, i) => ({
+      workerId: `worker-${i + 1}`,
+      queue: [],
+      weight: 0
+    }));
+
+    for (const item of sortedJobs) {
+      workers.sort((a, b) => a.weight - b.weight);
+      workers[0].queue.push(...item.job.queue);
+      workers[0].weight += item.weight;
+    }
+    workers.sort((a, b) => a.workerId.localeCompare(b.workerId));
+
+    // Если каждый поток получил хотя бы одну реплику — файловый план готов
+    if (!workers.some((worker) => worker.queue.length === 0)) {
+      return { ok: true, strategy: 'file_level', workers };
+    }
+  }
+
+  // --- УРОВЕНЬ 2: Одиночный или малый файл (файлов < потоков) ---
+  const allEntries = (jobs || []).flatMap((job) => job.queue || []);
   const groups = new Map();
 
-  jobs.forEach((job) => {
-    job.queue.forEach((entry) => {
-      const voiceId = String(entry.voiceId || '').trim();
-      if (!voiceId) return;
-      if (!groups.has(voiceId)) groups.set(voiceId, []);
-      groups.get(voiceId).push(entry);
-    });
+  allEntries.forEach((entry) => {
+    const voiceId = String(entry.voiceId || '').trim();
+    if (!voiceId) return;
+    if (!groups.has(voiceId)) groups.set(voiceId, []);
+    groups.get(voiceId).push(entry);
   });
 
-  const totalEntries = jobs.reduce((total, job) => total + job.queue.length, 0);
+  // 2a. Раскладка по голосам (если все реплики с голосами и голосов >= targetCount)
   const mappedEntries = [...groups.values()].reduce((total, entries) => total + entries.length, 0);
-  if (mappedEntries !== totalEntries) {
-    return { ok: false, reason: 'Для двух потоков нужны голоса у всех реплик' };
-  }
-  if (groups.size < 2) {
-    return { ok: false, reason: 'Для двух потоков нужны минимум два разных голоса' };
-  }
+  if (mappedEntries === totalEntries && groups.size >= targetCount) {
+    const workers = Array.from({ length: targetCount }, (_, i) => ({
+      workerId: `worker-${i + 1}`,
+      queue: [],
+      weight: 0
+    }));
 
-  const workers = [
-    { workerId: 'worker-1', queue: [], weight: 0 },
-    { workerId: 'worker-2', queue: [], weight: 0 }
-  ];
-  const sortedGroups = [...groups.entries()].sort((a, b) => {
-    const weightA = a[1].reduce((sum, entry) => sum + String(entry.text || '').length, 0);
-    const weightB = b[1].reduce((sum, entry) => sum + String(entry.text || '').length, 0);
-    return weightB - weightA;
-  });
+    const sortedGroups = [...groups.entries()].sort((a, b) => {
+      const weightA = a[1].reduce((sum, entry) => sum + String(entry.text || '').length, 0);
+      const weightB = b[1].reduce((sum, entry) => sum + String(entry.text || '').length, 0);
+      return weightB - weightA;
+    });
 
-  sortedGroups.forEach(([, entries]) => {
-    const target = workers[0].weight <= workers[1].weight ? workers[0] : workers[1];
-    target.queue.push(...entries);
-    target.weight += entries.reduce((sum, entry) => sum + String(entry.text || '').length, 0);
-  });
+    sortedGroups.forEach(([, entries]) => {
+      workers.sort((a, b) => a.weight - b.weight);
+      workers[0].queue.push(...entries);
+      workers[0].weight += entries.reduce((sum, entry) => sum + String(entry.text || '').length, 0);
+    });
+    workers.sort((a, b) => a.workerId.localeCompare(b.workerId));
 
-  if (workers.some((worker) => worker.queue.length === 0)) {
-    return { ok: false, reason: 'Не удалось равномерно разделить очередь' };
+    if (!workers.some((worker) => worker.queue.length === 0)) {
+      return { ok: true, strategy: 'voice_level', workers };
+    }
   }
 
-  return { ok: true, workers };
+  // 2b. Деление по непрерывным сегментам реплик (сбалансированные чанки)
+  const workers = Array.from({ length: targetCount }, (_, i) => ({
+    workerId: `worker-${i + 1}`,
+    queue: [],
+    weight: 0
+  }));
+  const chunkSize = Math.ceil(allEntries.length / targetCount);
+  for (let i = 0; i < targetCount; i++) {
+    const slice = allEntries.slice(i * chunkSize, (i + 1) * chunkSize);
+    workers[i].queue = slice;
+    workers[i].weight = slice.reduce((sum, entry) => sum + String(entry.text || '').length, 0);
+  }
+
+  const activeWorkers = workers.filter((worker) => worker.queue.length > 0);
+  if (activeWorkers.length < 2) {
+    return { ok: false, reason: 'Слишком мало реплик для разделения на несколько потоков' };
+  }
+
+  return { ok: true, strategy: 'chunk_level', workers: activeWorkers };
 }
 
 /**

@@ -2891,7 +2891,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             if (!extensionEnabled) return { success: false, reason: 'disabled' };
             return queueParallelOperation(() => {
               longTextStopRequested = false;
-              return startLongTextAwareBatch(request.jobs, request.tabId, true);
+              const workerCount = Number(request.threadCount || request.workerCount || 2);
+              return startLongTextAwareBatch(request.jobs, request.tabId, true, workerCount);
             });
           })
         ).then(sendResponse).catch((error) => sendResponse({ success: false, reason: error.message }));
@@ -3184,7 +3185,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             }
             await saveParallelBatchState();
             await chrome.alarms.clear('parallelBatchWatchdog');
-            await closeTabSafely(secondaryTabId);
+            const secondaryTabIds = Array.isArray(parallelBatchState.secondaryTabIds) && parallelBatchState.secondaryTabIds.length > 0
+              ? parallelBatchState.secondaryTabIds
+              : (parallelBatchState.secondaryTabId ? [parallelBatchState.secondaryTabId] : []);
+            await Promise.allSettled(secondaryTabIds.map((id) => closeTabSafely(id)));
             await saveAutomationState({
               progress: { currentIndex: 0, total: 0, completedIds: [], isRunning: false, isPaused: false, workerCount: 0 },
               mode: 'multi'
@@ -4048,8 +4052,10 @@ function buildRemainingParallelJobs() {
 }
 
 async function finishParallelBatch() {
-  const secondaryTabId = parallelBatchState.secondaryTabId;
-  DiagLog.info('parallel', 'Двухпоточный пакет завершён', {
+  const secondaryTabIds = Array.isArray(parallelBatchState.secondaryTabIds) && parallelBatchState.secondaryTabIds.length > 0
+    ? parallelBatchState.secondaryTabIds
+    : (parallelBatchState.secondaryTabId ? [parallelBatchState.secondaryTabId] : []);
+  DiagLog.info('parallel', 'Параллельный пакет завершён', {
     runId: parallelBatchState.runId,
     workers: (parallelBatchState.workers || []).map((worker) => ({
       workerId: worker.workerId,
@@ -4060,7 +4066,7 @@ async function finishParallelBatch() {
   parallelBatchState = __pb_getDefaultState();
   await saveParallelBatchState();
   await chrome.alarms.clear('parallelBatchWatchdog');
-  await closeTabSafely(secondaryTabId);
+  await Promise.allSettled(secondaryTabIds.map((id) => closeTabSafely(id)));
   await saveAutomationState({
     progress: { currentIndex: 0, total: 0, completedIds: [], isRunning: false, isPaused: false, workerCount: 0 },
     mode: 'multi'
@@ -4109,8 +4115,10 @@ async function fallbackParallelBatch(reason) {
   parallelBatchState = __pb_getDefaultState();
   await saveParallelBatchState();
   await chrome.alarms.clear('parallelBatchWatchdog');
-  await closeTabSafely(secondaryTabId);
-
+  const secondaryTabIds = Array.isArray(parallelBatchState.secondaryTabIds) && parallelBatchState.secondaryTabIds.length > 0
+    ? parallelBatchState.secondaryTabIds
+    : (parallelBatchState.secondaryTabId ? [parallelBatchState.secondaryTabId] : []);
+  await Promise.allSettled(secondaryTabIds.map((id) => closeTabSafely(id)));
   if (remainingJobs.length === 0) {
     await finishParallelBatch();
     return;
@@ -4170,39 +4178,51 @@ async function updateParallelWorker(request, sender, isComplete = false) {
   }
 }
 
-async function prepareParallelBatchProcessing(jobs, primaryTabId) {
+async function prepareParallelBatchProcessing(jobs, primaryTabId, requestedWorkerCount = 2) {
   await Promise.all([loadBatchState(), loadParallelBatchState()]);
   if (batchState.isRunning || parallelBatchState.isRunning) {
     throw new Error('automation_already_running');
   }
 
+  const targetWorkerCount = Math.max(2, Math.min(4, Number(requestedWorkerCount || 2)));
   const originalJobs = annotateParallelJobs(jobs);
-  const plan = buildParallelPlan(originalJobs);
+  const plan = buildParallelPlan(originalJobs, targetWorkerCount);
   if (!plan.ok) throw new Error(plan.reason);
 
-  let secondaryTab = null;
+  const secondaryTabs = [];
+  const secondaryTabIds = [];
   try {
     await waitForParallelTab(primaryTabId, 10000);
-    secondaryTab = await chrome.tabs.create({ url: MINIMAX_TTS_URL, active: false });
+    for (let i = 1; i < plan.workers.length; i++) {
+      const tab = await chrome.tabs.create({ url: MINIMAX_TTS_URL, active: false });
+      secondaryTabs.push(tab);
+      secondaryTabIds.push(tab.id);
+    }
     const runId = `parallel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     parallelBatchState = {
       ...__pb_getDefaultState(),
       phase: 'preparing',
       runId,
       primaryTabId,
-      secondaryTabId: secondaryTab.id,
+      secondaryTabId: secondaryTabIds[0] || null,
+      secondaryTabIds,
       originalJobs,
       startedAt: Date.now()
     };
     await saveParallelBatchState();
-    await waitForParallelTab(secondaryTab.id);
+
+    for (const tabId of secondaryTabIds) {
+      await waitForParallelTab(tabId);
+    }
 
     await assertDirectTtsCapability(primaryTabId);
-    await assertDirectTtsCapability(secondaryTab.id);
+    for (const tabId of secondaryTabIds) {
+      await assertDirectTtsCapability(tabId);
+    }
 
     const workers = plan.workers.map((worker, index) => ({
       ...worker,
-      tabId: index === 0 ? primaryTabId : secondaryTab.id,
+      tabId: index === 0 ? primaryTabId : secondaryTabIds[index - 1],
       currentIndex: 0,
       total: worker.queue.length,
       status: 'preparing',
@@ -4216,8 +4236,6 @@ async function prepareParallelBatchProcessing(jobs, primaryTabId) {
         voiceId: firstEntry.voiceId,
         voiceName: firstEntry.voiceName,
         language: firstEntry.language || 'Auto'
-      // A fresh secondary tab must load My Voices before applying an Instant Clone.
-      // This is materially slower than the already-warm primary tab.
       }, 60000).then((response) => {
         if (!response?.success) throw new Error(response?.reason || 'Worker preflight failed');
       });
@@ -4228,9 +4246,9 @@ async function prepareParallelBatchProcessing(jobs, primaryTabId) {
       queue: getParallelQueueSnapshot(worker.queue)
     }));
     await saveParallelBatchState();
-    return { runId, originalJobs, secondaryTab, workers };
+    return { runId, originalJobs, secondaryTabs, secondaryTabIds, secondaryTab: secondaryTabs[0] || null, workers };
   } catch (error) {
-    await closeTabSafely(secondaryTab?.id);
+    await Promise.allSettled(secondaryTabIds.map((id) => closeTabSafely(id)));
     parallelBatchState = __pb_getDefaultState();
     await saveParallelBatchState();
     throw error;
@@ -4238,7 +4256,10 @@ async function prepareParallelBatchProcessing(jobs, primaryTabId) {
 }
 
 async function discardPreparedParallelBatch(prepared) {
-  await closeTabSafely(prepared?.secondaryTab?.id);
+  const tabIds = Array.isArray(prepared?.secondaryTabIds) && prepared.secondaryTabIds.length > 0
+    ? prepared.secondaryTabIds
+    : (prepared?.secondaryTab?.id ? [prepared.secondaryTab.id] : []);
+  await Promise.allSettled(tabIds.map((id) => closeTabSafely(id)));
   await loadParallelBatchState();
   if (parallelBatchState.phase !== 'preparing') return;
   if (prepared?.runId && parallelBatchState.runId !== prepared.runId) return;
@@ -4246,11 +4267,11 @@ async function discardPreparedParallelBatch(prepared) {
   await saveParallelBatchState();
 }
 
-async function startParallelBatchProcessing(jobs, primaryTabId, prepared = null) {
+async function startParallelBatchProcessing(jobs, primaryTabId, prepared = null, requestedWorkerCount = 2) {
   let context = prepared;
   try {
-    if (!context) context = await prepareParallelBatchProcessing(jobs, primaryTabId);
-    const { runId, originalJobs, secondaryTab, workers } = context;
+    if (!context) context = await prepareParallelBatchProcessing(jobs, primaryTabId, requestedWorkerCount);
+    const { runId, originalJobs, secondaryTab, secondaryTabIds = [], workers } = context;
 
     parallelBatchState = {
       phase: 'running',
@@ -4259,7 +4280,8 @@ async function startParallelBatchProcessing(jobs, primaryTabId, prepared = null)
       isFallingBack: false,
       runId,
       primaryTabId,
-      secondaryTabId: secondaryTab.id,
+      secondaryTabId: secondaryTab?.id || secondaryTabIds[0] || null,
+      secondaryTabIds: secondaryTabIds.length > 0 ? secondaryTabIds : (secondaryTab?.id ? [secondaryTab.id] : []),
       originalJobs,
       workers: workers.map((worker) => ({
         ...worker,
@@ -4289,9 +4311,11 @@ async function startParallelBatchProcessing(jobs, primaryTabId, prepared = null)
 
     return { success: true, parallel: true, runId, workerCount: workers.length };
   } catch (error) {
+    const tabIdsToClose = Array.isArray(parallelBatchState.secondaryTabIds) && parallelBatchState.secondaryTabIds.length > 0
+      ? parallelBatchState.secondaryTabIds
+      : (parallelBatchState.secondaryTabId ? [parallelBatchState.secondaryTabId] : []);
     if (parallelBatchState.isRunning) {
       const tabIds = parallelBatchState.workers.map((worker) => worker.tabId);
-      const secondaryTabId = parallelBatchState.secondaryTabId;
       await Promise.allSettled(tabIds.map((tabId) => sendTabMessageWithTimeout(tabId, { action: 'stopAutomation' }, 7000)));
       const unconfirmedWorkers = [];
       for (const worker of parallelBatchState.workers) {
@@ -4307,7 +4331,7 @@ async function startParallelBatchProcessing(jobs, primaryTabId, prepared = null)
       if (unconfirmedWorkers.length === 0) {
         parallelBatchState = __pb_getDefaultState();
         await saveParallelBatchState();
-        await closeTabSafely(secondaryTabId);
+        await Promise.allSettled(tabIdsToClose.map((id) => closeTabSafely(id)));
       } else {
         parallelBatchState.isRunning = false;
         parallelBatchState.isPaused = false;
@@ -4315,7 +4339,8 @@ async function startParallelBatchProcessing(jobs, primaryTabId, prepared = null)
         await saveParallelBatchState();
       }
     } else {
-      await closeTabSafely(context?.secondaryTab?.id);
+      const contextTabs = context?.secondaryTabIds || (context?.secondaryTab?.id ? [context.secondaryTab.id] : []);
+      await Promise.allSettled(contextTabs.map((id) => closeTabSafely(id)));
     }
     return { success: false, parallel: false, reason: error.message };
   }
@@ -4373,10 +4398,14 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     if (parallelBatchState.isRunning) {
       if (!parallelBatchState.workers.some((worker) => worker.tabId === tabId)) return;
 
-      if (tabId === parallelBatchState.primaryTabId && parallelBatchState.secondaryTabId) {
-        parallelBatchState.primaryTabId = parallelBatchState.secondaryTabId;
-        parallelBatchState.secondaryTabId = null;
-        await saveParallelBatchState();
+      if (tabId === parallelBatchState.primaryTabId) {
+        const remainingSecondary = (parallelBatchState.secondaryTabIds || []).filter((id) => id !== tabId);
+        if (remainingSecondary.length > 0) {
+          parallelBatchState.primaryTabId = remainingSecondary[0];
+          parallelBatchState.secondaryTabIds = remainingSecondary.slice(1);
+          parallelBatchState.secondaryTabId = parallelBatchState.secondaryTabIds[0] || null;
+          await saveParallelBatchState();
+        }
       }
       await fallbackParallelBatch('Одна из рабочих вкладок была закрыта');
       return;
@@ -4491,14 +4520,15 @@ async function initializeLegacyBatchState() {
   await processNextBatchItemLocked();
 }
 
-async function startLongTextAwareBatch(jobs, tabId, useParallel) {
+async function startLongTextAwareBatch(jobs, tabId, useParallel, requestedThreadCount = 2) {
   await Promise.all([loadBatchState(), loadParallelBatchState(), loadLongTextState()]);
   DiagLog.info('batch', 'Запуск пакета', {
     mode: useParallel ? 'parallel' : 'single',
     jobs: jobs.length,
     entries: jobs.reduce((sum, job) => sum + (job.queue?.length || 0), 0),
     longText: jobs.reduce((sum, job) => sum + (job.queue || []).filter((entry) => entry.isLongText).length, 0),
-    tabId
+    tabId,
+    threadCount: requestedThreadCount
   });
   assertLongTextLimits(jobs);
   // Best-effort History sweep: download audio that already exists for past
@@ -4512,18 +4542,17 @@ async function startLongTextAwareBatch(jobs, tabId, useParallel) {
   if (batchState.isRunning || parallelBatchState.isRunning || getLongTextSummary().hasActive) {
     return { success: false, reason: 'automation_already_running' };
   }
-
   const { longTextEntries, regularJobs } = partitionLongTextJobs(jobs);
   let preparedParallel = null;
   let parallelFallbackReason = '';
   if (useParallel && regularJobs.length > 0) {
-    const plan = buildParallelPlan(regularJobs);
+    const plan = buildParallelPlan(regularJobs, requestedThreadCount);
     if (!plan.ok) {
       useParallel = false;
       parallelFallbackReason = plan.reason;
     } else {
       try {
-        preparedParallel = await prepareParallelBatchProcessing(regularJobs, tabId);
+        preparedParallel = await prepareParallelBatchProcessing(regularJobs, tabId, requestedThreadCount);
       } catch (error) {
         return { success: false, parallel: false, reason: error.message };
       }
@@ -4544,7 +4573,7 @@ async function startLongTextAwareBatch(jobs, tabId, useParallel) {
       throw new Error('Automation stopped before regular submission');
     }
     if (useParallel) {
-      regularResult = await startParallelBatchProcessing(regularJobs, tabId, preparedParallel);
+      regularResult = await startParallelBatchProcessing(regularJobs, tabId, preparedParallel, requestedThreadCount);
     } else {
       regularResult = await startLegacyBatchProcessing(regularJobs, tabId);
       if (parallelFallbackReason && regularResult.success !== false) {

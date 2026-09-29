@@ -158,6 +158,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const multiSkippedReportArea = document.getElementById('multiSkippedReportArea');
   const multiLongTextStatusArea = document.getElementById('multiLongTextStatusArea');
   const parallelModeToggle = document.getElementById('parallelModeToggle');
+  const threadSelectorGroup = document.getElementById('threadSelectorGroup');
   const parallelModeStatus = document.getElementById('parallelModeStatus');
   const parallelProgressCard = document.getElementById('parallelProgressCard');
   const parallelProgressSummary = document.getElementById('parallelProgressSummary');
@@ -233,7 +234,28 @@ document.addEventListener('DOMContentLoaded', async () => {
   updateCounterDisplay();
   initLanguageSelector();
   if (multiVoicePrefixInput) multiVoicePrefixInput.value = data.multiVoicePrefix || 'mp';
-  if (parallelModeToggle) parallelModeToggle.checked = parallelModeEnabled;
+  let parallelThreadCount = data.parallelThreadCount || (parallelModeEnabled ? 2 : 1);
+  function updateThreadPills(count) {
+    parallelThreadCount = Math.max(1, Math.min(4, Number(count || 1)));
+    parallelModeEnabled = parallelThreadCount > 1;
+    if (parallelModeToggle) parallelModeToggle.checked = parallelModeEnabled;
+    if (threadSelectorGroup) {
+      const pills = threadSelectorGroup.querySelectorAll('.thread-pill');
+      pills.forEach((p) => {
+        p.classList.toggle('active', Number(p.dataset.threads) === parallelThreadCount);
+      });
+    }
+    if (parallelModeStatus) {
+      if (parallelThreadCount <= 1) {
+        parallelModeStatus.textContent = 'Озвучка в 1 основном потоке (без фоновых вкладок).';
+      } else {
+        const extraTabs = parallelThreadCount - 1;
+        const tabWord = extraTabs === 1 ? 'дополнительная вкладка' : (extraTabs < 5 ? 'дополнительные вкладки' : 'дополнительных вкладок');
+        parallelModeStatus.textContent = `При запуске откроется ${extraTabs} ${tabWord} MiniMax (всего ${parallelThreadCount} потока).`;
+      }
+    }
+  }
+  updateThreadPills(parallelThreadCount);
   const lastDirectResult = data.directTtsLastResult;
   if (directTtsStatus) {
       const modeLabel = 'Транспорт: прямой API.';
@@ -244,9 +266,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           directTtsStatus.textContent = modeLabel;
       }
   }
-  if (parallelModeStatus && parallelModeEnabled) {
-      parallelModeStatus.textContent = 'При запуске откроется вторая вкладка MiniMax.';
-  }
+  // parallelModeStatus инициализируется внутри updateThreadPills
   renderSiteVoicesStatus(cachedSiteVoices.length ? `Загружено голосов: ${cachedSiteVoices.length}` : 'Нажмите «Обновить», чтобы подтянуть My Voices.', cachedSiteVoices.length ? 'success' : '');
   await loadBatchFiles();
   const automationRunning = await restoreAutomationState();
@@ -998,16 +1018,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   uploadButton.addEventListener('click', () => scriptFile.click());
   multiUploadButton.addEventListener('click', () => multiScriptFile.click());
   if (refreshSiteVoicesButton) refreshSiteVoicesButton.addEventListener('click', fetchSiteVoices);
+  if (threadSelectorGroup) {
+    threadSelectorGroup.addEventListener('click', async (e) => {
+      const pill = e.target.closest('.thread-pill');
+      if (!pill) return;
+      const count = Number(pill.dataset.threads) || 1;
+      updateThreadPills(count);
+      await chrome.storage.local.set({ parallelThreadCount: count, parallelModeEnabled: count > 1 });
+    });
+  }
   if (parallelModeToggle) {
-      parallelModeToggle.addEventListener('change', async () => {
-          parallelModeEnabled = parallelModeToggle.checked;
-          await chrome.storage.local.set({ parallelModeEnabled });
-          if (parallelModeStatus) {
-              parallelModeStatus.textContent = parallelModeEnabled
-                  ? 'При запуске откроется вторая вкладка MiniMax.'
-                  : '';
-          }
-      });
+    parallelModeToggle.addEventListener('change', async () => {
+      const count = parallelModeToggle.checked ? (parallelThreadCount > 1 ? parallelThreadCount : 2) : 1;
+      updateThreadPills(count);
+      await chrome.storage.local.set({ parallelThreadCount: count, parallelModeEnabled: count > 1 });
+    });
   }
 
   scriptFile.addEventListener('change', (e) => { handleMultipleFiles(e.target.files, 'single'); e.target.value = ''; });
@@ -2105,8 +2130,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       const action = parallelModeEnabled ? 'startParallelBatchProcessing' : 'startBatchProcessing';
       const longTextCount = getLongTextCount(batchJobs);
       if (longTextCount > 0) showStatus(`Отправляю Long Text: ${longTextCount}...`, 'info');
-      else if (parallelModeEnabled) showStatus('Проверяю вторую вкладку...', 'info');
-      const response = await chrome.runtime.sendMessage({ action, jobs: batchJobs, tabId: activeTabId }).catch((error) => ({
+      else if (parallelModeEnabled) showStatus(`Проверяю вкладки MiniMax (${parallelThreadCount} потока)...`, 'info');
+      const response = await chrome.runtime.sendMessage({
+        action,
+        jobs: batchJobs,
+        tabId: activeTabId,
+        threadCount: parallelThreadCount
+      }).catch((error) => ({
           success: false,
           reason: error?.message || 'start_failed'
       }));

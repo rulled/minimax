@@ -842,8 +842,39 @@
 
     .parallel-workers-grid {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
       gap: 8px;
+    }
+
+    .thread-selector-group {
+      display: inline-flex;
+      border-radius: var(--radius-sm);
+      background: var(--md-sys-color-surface-container);
+      padding: 2px;
+      gap: 2px;
+      border: 1px solid var(--md-sys-color-outline);
+    }
+
+    .thread-pill {
+      border: none;
+      background: transparent;
+      color: var(--md-sys-color-on-surface-variant);
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .thread-pill:hover {
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--md-sys-color-on-surface);
+    }
+
+    .thread-pill.active {
+      background: var(--md-sys-color-primary);
+      color: var(--md-sys-color-on-primary);
     }
 
     .parallel-worker-card {
@@ -1233,16 +1264,19 @@
           </section>
 
           <section class="card">
-            <div class="row">
+            <div class="row" style="align-items: center; justify-content: space-between;">
               <div>
-                <div class="toggle-label">2 потока</div>
-                <div style="font-size: 11px; color: var(--md-sys-color-on-surface-variant); margin-top: 3px;">экспериментально, с автоматическим fallback</div>
+                <div class="toggle-label">Параллельные потоки</div>
+                <div style="font-size: 11px; color: var(--md-sys-color-on-surface-variant); margin-top: 3px;">1 поток (обычный) или 2–4 параллельные вкладки</div>
               </div>
-              <label class="toggle-switch">
-                <input type="checkbox" id="parallelModeToggle">
-                <span class="toggle-slider"><span class="toggle-thumb"></span></span>
-              </label>
+              <div class="thread-selector-group" id="threadSelectorGroup">
+                <button type="button" class="thread-pill" data-threads="1">1</button>
+                <button type="button" class="thread-pill active" data-threads="2">2</button>
+                <button type="button" class="thread-pill" data-threads="3">3</button>
+                <button type="button" class="thread-pill" data-threads="4">4</button>
+              </div>
             </div>
+            <input type="checkbox" id="parallelModeToggle" style="display: none;">
             <div id="parallelModeStatus" class="voice-source-status"></div>
           </section>
 
@@ -1256,8 +1290,7 @@
 
         <p id="multiStatus" style="opacity: 0; transition: opacity 0.3s;"></p>
         <section id="parallelProgressCard" class="card parallel-progress-card" aria-live="polite">
-          <div class="card-title">2 потока</div>
-          <div id="parallelProgressSummary" class="parallel-progress-summary"></div>
+          <div class="card-title" id="parallelProgressTitle">Параллельный режим</div>
           <div class="parallel-progress-track"><div id="parallelProgressFill" class="parallel-progress-fill"></div></div>
           <div id="parallelWorkersGrid" class="parallel-workers-grid"></div>
           <div id="parallelTerminalReason" class="voice-source-status"></div>
