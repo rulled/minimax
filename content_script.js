@@ -1492,7 +1492,9 @@ class VoiceoverAutomation {
             // strips it before forwarding args to the MAIN world function,
             // which receives (text, signature, voiceId, requestedTimeout).
             const textLen = String(entry.text || '').length;
-            const generationTimeout = Math.max(60000, Math.min(300000, Math.ceil(textLen / 25) * 1000));
+            // Нижний порог 120 с (вместо 60 с): на нагруженном сервере и при работе других людей
+            // генерация может стоять в очереди 60–90 с. 120 с предотвращает ложный срыв очереди.
+            const generationTimeout = Math.max(120000, Math.min(300000, Math.ceil(textLen / 25) * 1000));
             directResult = await this.callDirectBridge(
                 'generateDirectAudio',
                 entry.text,
