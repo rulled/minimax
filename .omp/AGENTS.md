@@ -1,6 +1,6 @@
 # MiniMax TTS Automation — инварианты
 
-Chrome MV3 расширение (`manifest.json`, v3.3.2), plain JS без сборщика. Тесты — `node --test tests/<файл>` (npm-скриптов нет).
+Chrome MV3 расширение (`manifest.json`, v3.4.0), plain JS без сборщика. Тесты — `node --test tests/<файл>` (npm-скриптов нет).
 
 - **`dist/` и `backups/` не править руками.** `dist/test` — старая копия 3.2.4; релиз собирается `scripts/build-release.ps1` → `dist/minimax-v<версия>.zip`. `backups/*.bak` — снимки перед правкой резолвера. Хук `vsl-pipeline-guard.ts` блокирует правки в этих путях.
 - Расширение грузится из корня репозитория (`chrome://extensions` → Load unpacked), не из `dist/`.
