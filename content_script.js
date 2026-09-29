@@ -1261,17 +1261,23 @@ class VoiceoverAutomation {
                 }
 
                 entry.status = 'completed';
-                DiagLog.info('entry', 'Реплика готова', { speaker: entry.speaker, voiceId: entry.voiceId });
-                this.notifyProgress();
+                DiagLog.info('entry', 'Реплика готова', {
+                    workerId: this.workerId,
+                    speaker: entry.speaker,
+                    voiceId: entry.voiceId,
+                    charCount: String(entry.text || '').length
+                });
                 this.currentIndex++;
                 await this.sleep(1000);
             } catch (error) {
                 this.error(`Failed processing entry #${this.currentIndex}`, error);
                 DiagLog.warn('entry', 'Ошибка обработки реплики', {
+                    workerId: this.workerId,
                     speaker: entry.speaker,
                     voiceId: entry.voiceId,
                     attempt: Number(entry.attempt || 0) + 1,
                     paidSubmissionStarted: !!entry.paidSubmissionStarted,
+                    charCount: String(entry.text || '').length,
                     error: error.message
                 });
                 entry.attempt = Number(entry.attempt || 0) + 1;
@@ -1288,12 +1294,13 @@ class VoiceoverAutomation {
                         const effectiveWaitMs = RATE_LIMIT_WAIT_MS + jitterMs;
                         this.log(`Rate limited by MiniMax — retry ${entry.rateLimitAttempts}/${RATE_LIMIT_MAX_ATTEMPTS} in ${effectiveWaitMs} ms`);
                         DiagLog.warn('entry', 'Лимит частоты MiniMax — повтор после паузы', {
+                            workerId: this.workerId,
                             speaker: entry.speaker,
                             voiceId: entry.voiceId,
                             rateLimitAttempts: entry.rateLimitAttempts,
-                            waitMs: effectiveWaitMs
+                            waitMs: effectiveWaitMs,
+                            charCount: String(entry.text || '').length
                         });
-                        this.notifyProgress();
                         await this.sleep(effectiveWaitMs);
                         continue;
                     }
@@ -1567,13 +1574,14 @@ class VoiceoverAutomation {
             } else {
                 this.log(`Direct audio completed (${directResult.size || 0} bytes)`);
                 DiagLog.info('direct', 'Генерация готова', {
+                    workerId: this.workerId,
                     speaker: entry.speaker,
                     voiceId: entry.voiceId,
                     bytes: directResult.size || 0,
-                    durationMs: directResult.durationMs ?? null
+                    charCount: String(entry.text || '').length,
+                    durationMs: Date.now() - submittedAt
                 });
             }
-
         const fileNameBase = entry.originalTag || entry.speaker || 'dictor';
         let downloadRes;
 
