@@ -1202,6 +1202,208 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             };
           },
 
+          setStoreText: function(text) {
+            var webpackRequire = window.__mmWebpackRequire || null;
+            if (!webpackRequire) {
+              window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+              window.webpackChunk_N_E.push([['minimax-set-text-' + Date.now()], {}, function(require) {
+                webpackRequire = require;
+                window.__mmWebpackRequire = require;
+              }]);
+            }
+            if (!webpackRequire?.m) return { ok: false, reason: 'minimax_api_runtime_missing' };
+
+            var storeModuleId = webpackRequire.m['66021'] ? '66021' : Object.keys(webpackRequire.m).find(function(id) {
+              return String(webpackRequire.m[id]).indexOf('persistor:function') >= 0;
+            });
+            var store = storeModuleId ? webpackRequire(storeModuleId)?.store : null;
+            if (!store?.getState || !store?.dispatch) return { ok: false, reason: 'minimax_store_missing' };
+
+            var ttsModuleId = webpackRequire.m['3833'] ? '3833' : Object.keys(webpackRequire.m).find(function(id) {
+              return String(webpackRequire.m[id]).indexOf('name:"tts"') >= 0;
+            });
+            if (!ttsModuleId) return { ok: false, reason: 'minimax_tts_module_missing' };
+            var ttsMod = webpackRequire(ttsModuleId);
+            var setText = Object.values(ttsMod).find(function(v) {
+              return typeof v === 'function' && String(v) === 'tts/setText';
+            });
+            if (!setText) return { ok: false, reason: 'minimax_set_text_action_missing' };
+            var setCharCount = Object.values(ttsMod).find(function(v) {
+              return typeof v === 'function' && String(v) === 'tts/setCharacterCount';
+            });
+
+            var cleanText = String(text || '').replace(/\r\n?|\n/g, ' ');
+            store.dispatch(setText(cleanText));
+            if (setCharCount) store.dispatch(setCharCount(cleanText.length));
+
+            // Синхронизация Slate-дерева в DOM (если смонтировано), чтобы текст отображался в UI
+            try {
+              var el = document.querySelector('[data-slate-editor="true"]');
+              if (el) {
+                var fiberKey = Object.keys(el).find(function(k) { return k.startsWith('__reactFiber$'); });
+                var fiber = fiberKey ? el[fiberKey] : null;
+                var editor = null;
+                for (var i = 0; i < 25; i++) {
+                  if (!fiber) break;
+                  if (fiber.memoizedProps?.editor) { editor = fiber.memoizedProps.editor; break; }
+                  fiber = fiber.return;
+                }
+                if (editor) {
+                  editor.children = [{ type: 'paragraph', children: [{ text: cleanText }] }];
+                  if (typeof editor.onChange === 'function') editor.onChange();
+                }
+              }
+            } catch (e) {}
+
+            var current = String(store.getState()?.tts?.currentText || '');
+            var norm = function(s) { return String(s || '').replace(/\s+/g, ' ').trim(); };
+            if (norm(current) !== norm(cleanText)) {
+              return { ok: false, reason: 'text_not_applied', expected: cleanText, actual: current };
+            }
+            return { ok: true, length: cleanText.length };
+          },
+
+          setStoreLanguage: function(targetLang) {
+            var webpackRequire = window.__mmWebpackRequire || null;
+            if (!webpackRequire) {
+              window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+              window.webpackChunk_N_E.push([['minimax-set-lang-' + Date.now()], {}, function(require) {
+                webpackRequire = require;
+                window.__mmWebpackRequire = require;
+              }]);
+            }
+            if (!webpackRequire?.m) return { ok: false, reason: 'minimax_api_runtime_missing' };
+
+            var storeModuleId = webpackRequire.m['66021'] ? '66021' : Object.keys(webpackRequire.m).find(function(id) {
+              return String(webpackRequire.m[id]).indexOf('persistor:function') >= 0;
+            });
+            var store = storeModuleId ? webpackRequire(storeModuleId)?.store : null;
+            if (!store?.getState || !store?.dispatch) return { ok: false, reason: 'minimax_store_missing' };
+
+            var ttsModuleId = webpackRequire.m['3833'] ? '3833' : Object.keys(webpackRequire.m).find(function(id) {
+              return String(webpackRequire.m[id]).indexOf('name:"tts"') >= 0;
+            });
+            if (!ttsModuleId) return { ok: false, reason: 'minimax_tts_module_missing' };
+            var ttsMod = webpackRequire(ttsModuleId);
+            var setLanguage = Object.values(ttsMod).find(function(v) {
+              return typeof v === 'function' && String(v) === 'tts/setLanguage';
+            });
+            if (!setLanguage) return { ok: false, reason: 'minimax_set_language_action_missing' };
+
+            var detectModuleId = webpackRequire.m['56289'] ? '56289' : Object.keys(webpackRequire.m).find(function(id) {
+              return String(webpackRequire.m[id]).indexOf('name:"detect"') >= 0;
+            });
+            var detectMod = detectModuleId ? webpackRequire(detectModuleId) : null;
+            var setIsDetecting = detectMod ? Object.values(detectMod).find(function(v) {
+              return typeof v === 'function' && String(v) === 'detect/setIsDetecting';
+            }) : null;
+
+            var normTarget = String(targetLang || '').trim().toLowerCase();
+            if (!normTarget || normTarget === 'auto') {
+              store.dispatch(setLanguage(''));
+              if (setIsDetecting) store.dispatch(setIsDetecting(true));
+              return { ok: true, language: 'Auto', isDetecting: true };
+            }
+
+            var state = store.getState();
+            var langList = state?.tts?.voiceTags?.['1'] || [];
+            var match = langList.find(function(tag) {
+              return String(tag.tag_value || '').toLowerCase() === normTarget
+                || String(tag.tag_name || '').toLowerCase() === normTarget
+                || String(tag.locale || '').toLowerCase() === normTarget
+                || String(tag.code || '').toLowerCase() === normTarget;
+            });
+
+            var appliedValue = match ? match.tag_value : targetLang;
+            store.dispatch(setLanguage(appliedValue));
+            if (setIsDetecting) store.dispatch(setIsDetecting(false));
+
+            var afterState = store.getState();
+            var appliedBoost = String(afterState?.tts?.settings?.language_boost || '');
+            if (appliedBoost.toLowerCase() !== appliedValue.toLowerCase()) {
+              return { ok: false, reason: 'language_not_applied', expected: appliedValue, actual: appliedBoost };
+            }
+            return { ok: true, language: appliedValue, isDetecting: false };
+          },
+
+          setStoreSettings: function(newSettings) {
+            var webpackRequire = window.__mmWebpackRequire || null;
+            if (!webpackRequire) {
+              window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+              window.webpackChunk_N_E.push([['minimax-set-settings-' + Date.now()], {}, function(require) {
+                webpackRequire = require;
+                window.__mmWebpackRequire = require;
+              }]);
+            }
+            if (!webpackRequire?.m) return { ok: false, reason: 'minimax_api_runtime_missing' };
+
+            var storeModuleId = webpackRequire.m['66021'] ? '66021' : Object.keys(webpackRequire.m).find(function(id) {
+              return String(webpackRequire.m[id]).indexOf('persistor:function') >= 0;
+            });
+            var store = storeModuleId ? webpackRequire(storeModuleId)?.store : null;
+            if (!store?.getState || !store?.dispatch) return { ok: false, reason: 'minimax_store_missing' };
+
+            var ttsModuleId = webpackRequire.m['3833'] ? '3833' : Object.keys(webpackRequire.m).find(function(id) {
+              return String(webpackRequire.m[id]).indexOf('name:"tts"') >= 0;
+            });
+            if (!ttsModuleId) return { ok: false, reason: 'minimax_tts_module_missing' };
+            var ttsMod = webpackRequire(ttsModuleId);
+            var updateSettings = Object.values(ttsMod).find(function(v) {
+              return typeof v === 'function' && String(v) === 'tts/updateSettings';
+            });
+            if (!updateSettings) return { ok: false, reason: 'minimax_update_settings_action_missing' };
+
+            var payload = {};
+            if (typeof newSettings?.speed === 'number') payload.speed = newSettings.speed;
+            if (typeof newSettings?.vol === 'number') payload.vol = newSettings.vol;
+            if (typeof newSettings?.pitch === 'number') payload.pitch = newSettings.pitch;
+
+            store.dispatch(updateSettings(payload));
+            var current = store.getState()?.tts?.settings;
+            return {
+              ok: true,
+              speed: current?.speed,
+              vol: current?.vol,
+              pitch: current?.pitch
+            };
+          },
+
+          setStoreLongTextMode: function(enabled) {
+            var webpackRequire = window.__mmWebpackRequire || null;
+            if (!webpackRequire) {
+              window.webpackChunk_N_E = window.webpackChunk_N_E || [];
+              window.webpackChunk_N_E.push([['minimax-set-async-' + Date.now()], {}, function(require) {
+                webpackRequire = require;
+                window.__mmWebpackRequire = require;
+              }]);
+            }
+            if (!webpackRequire?.m) return { ok: false, reason: 'minimax_api_runtime_missing' };
+
+            var storeModuleId = webpackRequire.m['66021'] ? '66021' : Object.keys(webpackRequire.m).find(function(id) {
+              return String(webpackRequire.m[id]).indexOf('persistor:function') >= 0;
+            });
+            var store = storeModuleId ? webpackRequire(storeModuleId)?.store : null;
+            if (!store?.getState || !store?.dispatch) return { ok: false, reason: 'minimax_store_missing' };
+
+            var ttsModuleId = webpackRequire.m['3833'] ? '3833' : Object.keys(webpackRequire.m).find(function(id) {
+              return String(webpackRequire.m[id]).indexOf('name:"tts"') >= 0;
+            });
+            if (!ttsModuleId) return { ok: false, reason: 'minimax_tts_module_missing' };
+            var ttsMod = webpackRequire(ttsModuleId);
+            var updateIsAsync = Object.values(ttsMod).find(function(v) {
+              return typeof v === 'function' && String(v) === 'tts/updateIsAsync';
+            });
+            if (!updateIsAsync) return { ok: false, reason: 'minimax_update_is_async_action_missing' };
+
+            var targetState = Boolean(enabled);
+            store.dispatch(updateIsAsync(targetState));
+            var current = Boolean(store.getState()?.tts?.isAsync);
+            if (current !== targetState) {
+              return { ok: false, reason: 'async_mode_not_applied', expected: targetState, actual: current };
+            }
+            return { ok: true, isAsync: current };
+          },
+
           getGenerationCredit: async function(requestedCharacters) {
             var webpackRequire = null;
             window.webpackChunk_N_E = window.webpackChunk_N_E || [];
@@ -4070,14 +4272,15 @@ async function startParallelBatchProcessing(jobs, primaryTabId, prepared = null)
     await chrome.alarms.create('parallelBatchWatchdog', { periodInMinutes: 0.5 });
     await broadcastParallelProgress();
 
-    const startResults = await Promise.all(workers.map((worker) => {
+    const startResults = await Promise.all(workers.map((worker, index) => {
       return sendTabMessageWithTimeout(worker.tabId, {
         action: 'startAutomation',
         queue: worker.queue,
         mode: 'multi',
         scriptName: null,
         runId,
-        workerId: worker.workerId
+        workerId: worker.workerId,
+        startDelayMs: index > 0 ? index * 750 : 0
       }, 10000);
     }));
     if (startResults.some((response) => !response?.success)) {

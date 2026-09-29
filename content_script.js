@@ -193,6 +193,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       automation.setQueue(request.queue);
       automation.setMode(request.mode || 'single');
       automation.setScriptName(request.scriptName || null);
+      automation.setStartDelay(request.startDelayMs || 0);
       DiagLog.info('automation', 'Воркер принял очередь', {
         runId: request.runId || null,
         workerId: request.workerId || null,
@@ -424,6 +425,7 @@ class VoiceoverAutomation {
         this.heartbeatTimer = null;
         this.longTextCancellationRequested = false;
         this.longTextInFlight = false;
+        this.startDelayMs = 0;
         
         this.selectors = {
             textarea: '[data-slate-editor="true"]',
@@ -453,6 +455,10 @@ class VoiceoverAutomation {
 
     setLegacyJobId(legacyJobId) {
         this.legacyJobId = legacyJobId;
+    }
+
+    setStartDelay(delayMs) {
+        this.startDelayMs = Math.max(0, Number(delayMs || 0));
     }
 
     async prepareParallelWorker(voiceName, voiceId, language) {
@@ -500,6 +506,19 @@ class VoiceoverAutomation {
     }
 
     async setLongTextMode(enabled) {
+        // 1. Прямой путь через стор MiniMax
+        try {
+            const storeRes = await this.callBridgeTimed(3000, 'setStoreLongTextMode', enabled);
+            if (storeRes && storeRes.ok) {
+                this.log(`Long Text mode ${enabled ? 'enabled' : 'disabled'} via MiniMax store`);
+                return storeRes.isAsync;
+            }
+            this.log(`Store Long Text mode unavailable (${storeRes?.reason || 'unknown'}), falling back to UI switch`);
+        } catch (e) {
+            this.log(`Store Long Text mode error: ${e.message}, falling back to UI switch`);
+        }
+
+        // 2. UI-откат: клик по свитчу
         await this.openPageTab('Settings');
         const toggle = await this.waitForElement('.long-text-stats [role="switch"]', 5000)
             || await this.waitForElement('.characters-count-async-switch[role="switch"]', 2000);
@@ -1150,6 +1169,10 @@ class VoiceoverAutomation {
         this.log('Automation STARTED');
         let terminalError = null;
         try {
+            if (this.startDelayMs > 0) {
+                this.log(`Stagger delay: waiting ${this.startDelayMs}ms before start...`);
+                await this.sleep(this.startDelayMs);
+            }
             this.log('Ensuring Long Text mode is disabled...');
             const longTextWasEnabled = await this.setLongTextMode(false);
             if (longTextWasEnabled) {
@@ -1260,15 +1283,18 @@ class VoiceoverAutomation {
                     entry.submissionRejected = false;
                     entry.rateLimitAttempts = Number(entry.rateLimitAttempts || 0) + 1;
                     if (entry.rateLimitAttempts <= RATE_LIMIT_MAX_ATTEMPTS) {
-                        this.log(`Rate limited by MiniMax — retry ${entry.rateLimitAttempts}/${RATE_LIMIT_MAX_ATTEMPTS} in ${RATE_LIMIT_WAIT_MS} ms`);
+                        // Джиттер 0-2500 мс предотвращает синхронный повтор из параллельных потоков
+                        const jitterMs = Math.floor(Math.random() * 2500);
+                        const effectiveWaitMs = RATE_LIMIT_WAIT_MS + jitterMs;
+                        this.log(`Rate limited by MiniMax — retry ${entry.rateLimitAttempts}/${RATE_LIMIT_MAX_ATTEMPTS} in ${effectiveWaitMs} ms`);
                         DiagLog.warn('entry', 'Лимит частоты MiniMax — повтор после паузы', {
                             speaker: entry.speaker,
                             voiceId: entry.voiceId,
                             rateLimitAttempts: entry.rateLimitAttempts,
-                            waitMs: RATE_LIMIT_WAIT_MS
+                            waitMs: effectiveWaitMs
                         });
                         this.notifyProgress();
-                        await this.sleep(RATE_LIMIT_WAIT_MS);
+                        await this.sleep(effectiveWaitMs);
                         continue;
                     }
                     this.log(`Rate limit persists after ${RATE_LIMIT_MAX_ATTEMPTS} attempts — skipping entry`);
@@ -1683,6 +1709,13 @@ class VoiceoverAutomation {
     // --- ОЧИСТКА Slate перед следующей репликой ---
     async clearText() {
         this.log('Clearing editor before next insert...');
+        try {
+            const storeRes = await this.callBridgeTimed(3000, 'setStoreText', '');
+            if (storeRes && storeRes.ok) {
+                return;
+            }
+        } catch (e) {}
+
         const result = await this.callBridge('clearTextContent');
         if (!result?.ok) {
             throw new Error(`Editor clear failed: ${result?.reason || 'unknown reason'}`);
@@ -1697,10 +1730,23 @@ class VoiceoverAutomation {
 
     async insertText(el, text) {
         text = String(text || '').replace(/\r\n?|\n/g, ' ');
-        this.log(`🚀 Slate Insert (Length: ${text.length})...`);
+        this.log(`🚀 Text Insert (Length: ${text.length})...`);
         const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-        const insertTimeout = Math.max(15000, Math.ceil(text.length / 1000) * 200 + 5000);
 
+        // 1. Быстрый путь: установка текста напрямую через стор MiniMax
+        try {
+            const storeRes = await this.callBridgeTimed(5000, 'setStoreText', text);
+            if (storeRes && storeRes.ok) {
+                this.log(`✅ Text set via MiniMax store (Length: ${storeRes.length})`);
+                return { ok: true };
+            }
+            this.log(`⚠️ Store text set failed (${storeRes?.reason || 'unknown'}), fallback to Slate DOM`);
+        } catch (e) {
+            this.log(`⚠️ Store text set error: ${e.message}, fallback to Slate DOM`);
+        }
+
+        // 2. Fallback: Slate fiber DOM вставка
+        const insertTimeout = Math.max(15000, Math.ceil(text.length / 1000) * 200 + 5000);
         const result = await this.callBridgeTimed(insertTimeout, 'insertText', text);
         if (!result || !result.ok) {
             throw new Error('insertText via bridge failed: ' + (result && result.reason || 'unknown'));
@@ -1898,6 +1944,21 @@ class VoiceoverAutomation {
     }
 
     async ensureLanguage(targetLang) {
+        if (!targetLang) return;
+
+        // 1. Быстрый путь: установка языка напрямую через стор MiniMax
+        try {
+            const storeRes = await this.callBridgeTimed(3000, 'setStoreLanguage', targetLang);
+            if (storeRes && storeRes.ok) {
+                this.log(`✅ Language "${targetLang}" set via MiniMax store (${storeRes.language})`);
+                return;
+            }
+            this.log(`⚠️ Store language failed (${storeRes?.reason || 'unknown'}), fallback to UI`);
+        } catch (e) {
+            this.log(`⚠️ Store language error: ${e.message}, fallback to UI`);
+        }
+
+        // 2. Fallback: Ant-Select UI выпадашка
         const getCurrentLanguageText = () => {
             const currentValEl = document.querySelector(this.selectors.languageCurrentValue);
             return currentValEl ? currentValEl.innerText.trim() : '';
@@ -1907,9 +1968,7 @@ class VoiceoverAutomation {
         if (!trigger) throw new Error('Language selector not found');
 
         const currentText = getCurrentLanguageText();
-
         if (currentText === targetLang) return;
-
         const chooseLanguageOption = async () => {
             trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
             trigger.click();
