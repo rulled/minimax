@@ -1492,9 +1492,11 @@ class VoiceoverAutomation {
             // strips it before forwarding args to the MAIN world function,
             // which receives (text, signature, voiceId, requestedTimeout).
             const textLen = String(entry.text || '').length;
-            // Нижний порог 120 с (вместо 60 с): на нагруженном сервере и при работе других людей
-            // генерация может стоять в очереди 60–90 с. 120 с предотвращает ложный срыв очереди.
-            const generationTimeout = Math.max(120000, Math.min(300000, Math.ceil(textLen / 25) * 1000));
+            // Динамический расчет времени:
+            // 1. Базовый запас на очередь сервера и холодный коннект: 90 с
+            // 2. Время на стриминг аудио: ~80 мс на символ (12-13 симв/с)
+            // 3. Для 50 симв -> 94 с; для 1000 симв -> 170 с; для 4900 симв -> ~452 с (~7.5 мин).
+            const generationTimeout = Math.max(90000, Math.min(600000, Math.ceil(textLen * 80) + 60000));
             directResult = await this.callDirectBridge(
                 'generateDirectAudio',
                 entry.text,
@@ -1682,16 +1684,21 @@ class VoiceoverAutomation {
         // Lets the caller scale the wait for long-running transports like
         // generateDirectAudio on long text.
         let timeoutMs = 15000;
+        let passArgs = args;
         if (args.length > 0 && typeof args[args.length - 1] === 'number') {
             timeoutMs = Math.max(1000, args[args.length - 1]);
-            args = args.slice(0, -1);
+            if (['generateDirectAudio', 'submitDirectLongText'].includes(action)) {
+                passArgs = args;
+            } else {
+                passArgs = args.slice(0, -1);
+            }
         }
         try {
             const response = await Promise.race([
                 chrome.runtime.sendMessage({
                     action: 'executeInMainWorld',
                     method: action,
-                    args
+                    args: passArgs
                 }),
                 new Promise((_, reject) => setTimeout(() => reject(new Error('bridge_timeout')), timeoutMs))
             ]);

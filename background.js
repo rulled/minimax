@@ -1827,12 +1827,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               var settled = false;
               var opened = false;
               var audioHexChunks = [];
+              var inactivityTimer = null;
+              var INACTIVITY_TIMEOUT_MS = 60000;
               var finish = function(result) {
                 if (settled) return;
                 settled = true;
                 clearTimeout(timer);
+                clearTimeout(inactivityTimer);
                 try { manager.close(wsKey); } catch (error) {}
                 resolve(result);
+              };
+              var resetInactivity = function() {
+                clearTimeout(inactivityTimer);
+                inactivityTimer = setTimeout(function() {
+                  finish({
+                    ok: false,
+                    disposition: audioHexChunks.length > 0 ? 'accepted_unknown' : (opened ? 'rejected' : 'not_sent'),
+                    reason: audioHexChunks.length > 0 ? 'minimax_direct_stream_stalled' : 'minimax_direct_queue_timeout',
+                    msgId: msgId,
+                    chunksReceived: audioHexChunks.length
+                  });
+                }, INACTIVITY_TIMEOUT_MS);
               };
               var timer = setTimeout(function() {
                 finish(opened
@@ -1845,8 +1860,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                   url: '/v1/api/audio/ws',
                   body: frame,
                   wsKey: wsKey,
-                  onOpen: function() { opened = true; },
+                  onOpen: function() { opened = true; resetInactivity(); },
                   onMessage: function(message) {
+                    resetInactivity();
                     if (message?.method === 'Heartbeat') return;
                     var responseMeta = {
                       method: String(message?.method || ''),
